@@ -70,15 +70,17 @@ impl diSecretKey {
 #[serde_as]
 #[derive(Clone,Serialize, Deserialize)]
 pub struct CK {
-    id: Option<Uuid>,
+    pub email: String,
+    pub id: Option<Uuid>,
     #[serde_as(as = "Bytes")]
     ky_p: kyPublicKey,
     di_p: diPublicKey,
 }
 
 impl CK {
-    pub fn new(ky_p: kyPublicKey, di_p: diPublicKey) -> CK {
+    pub fn new(ky_p: kyPublicKey, di_p: diPublicKey, email: String) -> CK {
         CK {
+            email,
             id: None,
             ky_p,
             di_p,
@@ -134,6 +136,7 @@ impl ChallengesT for Challenges {
 pub trait PassesT {
     fn get_pass(&self, id: Uuid, pass_id: Uuid) -> ResultP<Vec<u8>>;
     fn add_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>);
+    fn get_all_pass(&self, id: Uuid) -> ResultP<Vec<Vec<u8>>>;
 }
 
 impl PassesT for Passes {
@@ -143,6 +146,16 @@ impl PassesT for Passes {
 
     fn add_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>) {
         self.0.insert((id, pass_id), pass);
+    }
+
+    fn get_all_pass(&self, id: Uuid) -> ResultP<Vec<Vec<u8>>> {
+        let mut res = Vec::new();
+        for (k, v) in &self.0 {
+            if k.0 == id {
+                res.push(v.clone());
+            }
+        }
+        Ok(res)
     }
 }
 
@@ -200,7 +213,10 @@ impl<T: SecretsT+Clone, U: PassesT+Clone, D: ChallengesT+Clone> Server<T, U, D> 
         Ok(challenge)
     }
 
-    pub fn verify(&self, id: Uuid, signature: [u8;4595]) -> ResultP<()> {
+    pub fn verify(&self, id: Uuid, signature: &[u8]) -> ResultP<()> {
+        if signature.len() != di::SIGNBYTES {
+            return Err(ProtocolError::AuthError);
+        }
         let ck = self.get_user(id)?;
         let challenge = self.challenges.get_challenge(id)?;
         let verify = ck.di_p.to_di().verify(&challenge, &signature);
@@ -237,6 +253,30 @@ impl<T: SecretsT+Clone, U: PassesT+Clone, D: ChallengesT+Clone> Server<T, U, D> 
             nonce: passs.nonce,
             nonce2: Some(nonce.to_vec()),
         })
+    }
+
+    pub fn send_all(&mut self, id: Uuid) -> ResultP<Vec<EP>> {
+        let _ = self.get_user(id)?;
+        let secret = self.secrets.get_secret(id)?;
+        let hash = hash(&secret);
+        let key: &Key = Key::from_slice(hash.as_bytes());
+        let cipher = XChaCha20Poly1305::new(key);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut self.rng);
+        let pass = self.passes.get_all_pass(id)?;
+        let mut res = Vec::new();
+        for p in pass {
+            let passs: EP = bincode::deserialize(&p).unwrap();
+            println!("ciphertext: {:?} ", passs.ciphertext);
+            let ciphertext = cipher.encrypt(&nonce, passs.ciphertext.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
+            println!("nonce 2: {:?} ", nonce);
+            println!("nonce: {:?} ", passs.nonce);
+            res.push(EP {
+                ciphertext,
+                nonce: passs.nonce,
+                nonce2: Some(nonce.to_vec()),
+            });
+        }
+        Ok(res)
     }
 
     pub fn create_pass(&mut self, id: Uuid, pass: EP) -> ResultP<Uuid> {
@@ -381,11 +421,11 @@ impl Client {
         Ok(pass)
     }
 
-    pub fn sign(&self, challenge: [u8; 32]) -> [u8; crystals_dilithium::dilithium5::SIGNBYTES] {
-        di::SecretKey::sign(&self.di_q.clone().to_di(), &challenge)    
+    pub fn sign(&self, challenge: &[u8]) -> [u8; crystals_dilithium::dilithium5::SIGNBYTES] {
+        di::SecretKey::sign(&self.di_q.clone().to_di(), challenge)    
     }
 
-    pub fn sync(&mut self, ciphertextsync: [u8; KYBER_CIPHERTEXTBYTES]) -> ResultP<()> {
+    pub fn sync(&mut self, ciphertextsync: &[u8]) -> ResultP<()> {
         let s = ky::decapsulate(&ciphertextsync, &self.ky_q).map_err(|_| ProtocolError::CryptoError)?;
         self.secret = Some(s);
         Ok(())
