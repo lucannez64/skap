@@ -1,4 +1,4 @@
-use rand::RngCore;
+use rand::{rngs::StdRng, RngCore, SeedableRng};
 use thiserror::Error;
 use blake3::hash;
 use chacha20poly1305::{aead::{generic_array::typenum::Unsigned, Aead, AeadCore, KeyInit, OsRng}, consts::U24, Key, KeySizeUser, XChaCha20Poly1305, XNonce};
@@ -90,9 +90,10 @@ impl CK {
     }
 }
 
-pub struct Server<T: SecretsT, U: PassesT,  D: ChallengesT> {
+#[derive(Clone)]
+pub struct Server<T: SecretsT + Clone, U: PassesT+Clone,  D: ChallengesT+Clone> {
     data: Vec<CK>,
-    rng: OsRng,
+    rng: StdRng,
     challenges: D,
     secrets: T,
     passes: U,
@@ -100,10 +101,13 @@ pub struct Server<T: SecretsT, U: PassesT,  D: ChallengesT> {
     ky_q: kySecretKey,
 }
 
+#[derive(Clone)]
 pub struct Secrets(HashMap<Uuid, [u8; 32]>);
 
+#[derive(Clone)]
 pub struct Passes(HashMap<(Uuid, Uuid), Vec<u8>>);
 
+#[derive(Clone)]
 pub struct Challenges(HashMap<Uuid, [u8; 32]>);
 
 
@@ -155,7 +159,7 @@ impl SecretsT for Secrets {
 
 impl Server<Secrets, Passes, Challenges> {
     pub fn new() -> ResultP<Self> {
-        let mut rng = OsRng;
+        let mut rng = SeedableRng::from_entropy();
         let keypair = ky::keypair(&mut rng).map_err(|_| ProtocolError::CryptoError)?;
         let ky_p = keypair.public;
         let ky_q = keypair.secret;
@@ -171,7 +175,7 @@ impl Server<Secrets, Passes, Challenges> {
     }
 }
 
-impl<T: SecretsT, U: PassesT, D: ChallengesT> Server<T, U, D> {
+impl<T: SecretsT+Clone, U: PassesT+Clone, D: ChallengesT+Clone> Server<T, U, D> {
     pub fn add_user(&mut self, ck: CK) -> ResultP<Uuid> {
         let mut ck = ck.clone();
         ck.set_id();
