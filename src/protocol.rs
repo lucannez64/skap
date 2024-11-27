@@ -137,6 +137,8 @@ pub trait PassesT {
     fn get_pass(&self, id: Uuid, pass_id: Uuid) -> ResultP<Vec<u8>>;
     fn add_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>);
     fn get_all_pass(&self, id: Uuid) -> ResultP<Vec<Vec<u8>>>;
+    fn remove_pass(&mut self, id: Uuid, pass_id: Uuid) -> ResultP<()>;
+    fn update_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>);
 }
 
 impl PassesT for Passes {
@@ -156,6 +158,16 @@ impl PassesT for Passes {
             }
         }
         Ok(res)
+    }
+
+    fn remove_pass(&mut self, id: Uuid, pass_id: Uuid) -> ResultP<()> {
+        self.0.remove(&(id, pass_id)).ok_or(ProtocolError::StorageError)
+    }
+
+    fn update_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>) -> Result<P> {
+        self.remove_pass(id, pass_id)?;
+        self.add_pass(id, pass_id, pass)?;
+        Ok(())
     }
 }
 
@@ -303,6 +315,35 @@ impl<T: SecretsT+Clone, U: PassesT+Clone, D: ChallengesT+Clone> Server<T, U, D> 
         let bi= bincode::serialize(&ep).map_err(|_| ProtocolError::DataError)?;
         self.passes.add_pass(id, id2, bi);
         Ok(id2)
+    }
+
+    pub fn update_pass(&mut self, id: Uuid, passid: Uuid, pass: EP) -> ResultP<()> {
+        let _ck = self.get_user(id)?;
+        let secret = self.secrets.get_secret(id)?;
+        let passb = bincode::serialize(&pass).map_err(|_| ProtocolError::DataError)?;
+        let hash = hash(&secret);
+        let key: &Key = Key::from_slice(hash.as_bytes());
+        let cipher = XChaCha20Poly1305::new(key);
+        let nonce2 = pass.nonce2.clone().ok_or(ProtocolError::DataError)?;
+        // NONCE 2
+        println!("receive after");
+        // DECRYPT 
+        let pass2 = cipher.decrypt(XNonce::from_slice(&nonce2), pass.ciphertext.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
+        println!("pass: {:?} ", pass2);
+        let ep = EP {
+            ciphertext: pass2,
+            nonce: pass.nonce,
+            nonce2: None,
+        };
+        let bi= bincode::serialize(&ep).map_err(|_| ProtocolError::DataError)?;
+        self.passes.update_pass(id, passid, bi);
+        Ok(())
+    }
+
+    pub fn delete_pass(&mut self, id: Uuid, passid: Uuid) -> ResultP<()> {
+        let _ck = self.get_user(id)?;
+        self.passes.remove_pass(id, passid);
+        Ok(())
     }
 }
 

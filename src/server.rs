@@ -102,6 +102,27 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
+    
+    let update_pass = warp::post()
+        .and(warp::path("update_pass"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::param::<String>())
+        .and(warp::body::bytes())
+        .and(server_filter.clone())
+        .map(|uui: String,uui2: String,pass: bytes::Bytes,server2: Arc<Mutex<Server2<Secrets, Passes, Challenges>>>| {
+            let mut server = server2.lock().unwrap();
+            let id = uuid::Uuid::parse_str(&uui).unwrap();
+            let id2 = uuid::Uuid::parse_str(&uui2).unwrap();
+            let ep =bincode::deserialize::<EP>(&pass).unwrap();
+            match server.update_pass(id, id2, ep) {
+                Ok(()) => {
+                    warp::reply::Response::new(bincode::serialize(&"OK").unwrap().into())
+                },
+                Err(_) => warp::reply::Response::new(bincode::serialize(&"INTERNAL_SERVER_ERROR").unwrap().into())
+            }
+        });
+
+
     let send = warp::get()
         .and(warp::path("send"))
         .and(warp::path::param::<String>())
@@ -134,7 +155,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-    let routes = create_user.or(challenge).or(sync).or(create_pass).or(send).or(verify).or(send_all);
+    let routes = create_user.or(challenge).or(sync).or(create_pass).or(send).or(verify).or(send_all).or(update_pass);
     warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
     Ok(())
 }

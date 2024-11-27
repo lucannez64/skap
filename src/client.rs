@@ -1,6 +1,5 @@
 use crate::protocol::*;
 use uuid::Uuid;
-use warp::filters::body::bytes;
 
 const BASE_URL: &str = "http://127.0.0.1:3030/";
 
@@ -42,6 +41,16 @@ pub async fn create_pass(client2: &reqwest::Client, uuid: Uuid, client: &mut Cli
     Ok(bincode::deserialize::<Uuid>(&res.bytes().await?).unwrap())
 }
 
+pub async fn update_pass(client2: &reqwest::Client, uuid: Uuid, uuid2: Uuid,client: &mut Client, pass: Password) -> Result<(Uuid), reqwest::Error> {
+    let encrypted = client.encrypt(pass.clone()).unwrap();
+    let eq = client.send(encrypted).unwrap();
+    let res = client2.post(BASE_URL.to_string()+"update_pass/"+uuid.to_string().as_str()+"/"+uuid2.to_string().as_str()+"/")
+        .body(bincode::serialize(&eq).unwrap())
+        .send()
+        .await?;
+    Ok(bincode::deserialize::<Uuid>(&res.bytes().await?).unwrap())
+}
+
 pub async fn get_all(client2: &reqwest::Client, uuid: Uuid, client: &mut Client) -> Result<(Vec<Password>), reqwest::Error> {
     let res = client2.get(BASE_URL.to_string()+"send_all/"+uuid.to_string().as_str()+"/")
         .send()
@@ -54,4 +63,11 @@ pub async fn get_all(client2: &reqwest::Client, uuid: Uuid, client: &mut Client)
         passwords.push(p);
     }
     Ok(passwords)
+}
+
+pub async fn delete_pass(client2: &reqwest::Client, uuid: Uuid, uuid2: Uuid,client: &mut Client) -> Result<(Uuid), reqwest::Error> {
+    let res = client2.get(BASE_URL.to_string()+"delete_pass/"+uuid.to_string().as_str()+"/"+uuid2.to_string().as_str()+"/")
+        .send()
+        .await?;
+    Ok(bincode::deserialize::<Uuid>(&res.bytes().await?).unwrap())
 }
