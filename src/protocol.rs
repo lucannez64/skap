@@ -93,7 +93,7 @@ impl CK {
 }
 
 #[derive(Clone)]
-pub struct Server<T: SecretsT + Clone, U: PassesT+Clone,  D: ChallengesT+Clone> {
+pub struct Server<T: SecretsT, U: PassesT,  D: ChallengesT> {
     data: Vec<CK>,
     rng: StdRng,
     challenges: D,
@@ -103,13 +103,10 @@ pub struct Server<T: SecretsT + Clone, U: PassesT+Clone,  D: ChallengesT+Clone> 
     ky_q: kySecretKey,
 }
 
-#[derive(Clone)]
 pub struct Secrets(HashMap<Uuid, [u8; 32]>);
 
-#[derive(Clone)]
 pub struct Passes(HashMap<(Uuid, Uuid), Vec<u8>>);
 
-#[derive(Clone)]
 pub struct Challenges(HashMap<Uuid, [u8; 32]>);
 
 
@@ -161,13 +158,12 @@ impl PassesT for Passes {
     }
 
     fn remove_pass(&mut self, id: Uuid, pass_id: Uuid) -> ResultP<()> {
-        self.0.remove(&(id, pass_id)).ok_or(ProtocolError::StorageError)
+        self.0.remove(&(id, pass_id)).ok_or(ProtocolError::StorageError).map(|_| ())
     }
 
-    fn update_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>) -> Result<P> {
-        self.remove_pass(id, pass_id)?;
-        self.add_pass(id, pass_id, pass)?;
-        Ok(())
+    fn update_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>) {
+        self.remove_pass(id, pass_id);
+        self.add_pass(id, pass_id, pass);
     }
 }
 
@@ -200,7 +196,7 @@ impl Server<Secrets, Passes, Challenges> {
     }
 }
 
-impl<T: SecretsT+Clone, U: PassesT+Clone, D: ChallengesT+Clone> Server<T, U, D> {
+impl<T: SecretsT, U: PassesT, D: ChallengesT> Server<T, U, D> {
     pub fn add_user(&mut self, ck: CK) -> ResultP<Uuid> {
         let mut ck = ck.clone();
         ck.set_id();
