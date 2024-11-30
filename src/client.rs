@@ -51,23 +51,27 @@ pub async fn update_pass(client2: &reqwest::Client, uuid: Uuid, uuid2: Uuid,clie
     Ok(bincode::deserialize::<Uuid>(&res.bytes().await?).unwrap())
 }
 
-pub async fn get_all(client2: &reqwest::Client, uuid: Uuid, client: &mut Client) -> Result<(Vec<Password>), reqwest::Error> {
+pub async fn get_all(client2: &reqwest::Client, uuid: Uuid, client: &mut Client) -> Result<Vec<(Password, Uuid)>, reqwest::Error> {
     let res = client2.get(BASE_URL.to_string()+"send_all/"+uuid.to_string().as_str()+"/")
         .send()
         .await?;
     let d = res.bytes().await?;
-    let mut passwords: Vec<Password> = Vec::new();
-    let da = bincode::deserialize::<Vec<EP>>(&d).unwrap();
+    let mut passwords: Vec<(Password, Uuid)> = Vec::new();
+    let da = bincode::deserialize::<Vec<(EP, Uuid)>>(&d).unwrap();
     for g in da.iter() {
-        let p = client.receive(g.clone()).unwrap();
-        passwords.push(p);
+        let p = client.receive(g.0.clone()).unwrap();
+        passwords.push((p, g.1.clone()));
     }
     Ok(passwords)
 }
 
-pub async fn delete_pass(client2: &reqwest::Client, uuid: Uuid, uuid2: Uuid,client: &mut Client) -> Result<(Uuid), reqwest::Error> {
+pub async fn delete_pass(client2: &reqwest::Client, uuid: Uuid, uuid2: Uuid) -> ResultP<()> {
     let res = client2.get(BASE_URL.to_string()+"delete_pass/"+uuid.to_string().as_str()+"/"+uuid2.to_string().as_str()+"/")
         .send()
-        .await?;
-    Ok(bincode::deserialize::<Uuid>(&res.bytes().await?).unwrap())
+        .await.map_err(|_| ProtocolError::DataError)?;
+    let p = bincode::deserialize::<String>(&res.bytes().await.map_err(|_| ProtocolError::DataError)?).unwrap();
+    match p.as_str() {
+        "OK" => Ok(()),
+        _ => Err(ProtocolError::DataError),
+    }
 }

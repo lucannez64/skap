@@ -1,13 +1,14 @@
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use thiserror::Error;
 use blake3::hash;
+use crate::{database::PassesSureal, postgres::PassesPostgres};
 use chacha20poly1305::{aead::{generic_array::typenum::Unsigned, Aead, AeadCore, KeyInit, OsRng}, consts::U24, Key, KeySizeUser, XChaCha20Poly1305, XNonce};
 use std::{collections::HashMap};
 use std::fmt;
 use serde_with::{serde_as, Bytes};
 use serde::{Deserialize, Serialize, Deserializer};
 use serde::de::{self, Visitor};
-use pqc_kyber::{self as ky, KYBER_CIPHERTEXTBYTES, KYBER_SECRETKEYBYTES, KYBER_SSBYTES};
+use pqc_kyber::{self as ky, KYBER_CIPHERTEXTBYTES, KYBER_SSBYTES};
 use crystals_dilithium::dilithium5 as di;
 use uuid::Uuid;
 use sharks::{Sharks, Share};
@@ -131,39 +132,41 @@ impl ChallengesT for Challenges {
 }
 
 pub trait PassesT {
-    fn get_pass(&self, id: Uuid, pass_id: Uuid) -> ResultP<Vec<u8>>;
-    fn add_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>);
-    fn get_all_pass(&self, id: Uuid) -> ResultP<Vec<Vec<u8>>>;
-    fn remove_pass(&mut self, id: Uuid, pass_id: Uuid) -> ResultP<()>;
-    fn update_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>);
+    async fn get_pass(&self, id: Uuid, pass_id: Uuid) -> ResultP<Vec<u8>>;
+    async fn add_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>) -> ResultP<()>;
+    async fn get_all_pass(&self, id: Uuid) -> ResultP<Vec<(Vec<u8>, Uuid)>>;
+    async fn remove_pass(&mut self, id: Uuid, pass_id: Uuid) -> ResultP<()>;
+    async fn update_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>) -> ResultP<()>;
 }
 
 impl PassesT for Passes {
-    fn get_pass(&self, id: Uuid, pass_id: Uuid) -> ResultP<Vec<u8>> {
+    async fn get_pass(&self, id: Uuid, pass_id: Uuid) -> ResultP<Vec<u8>> {
         self.0.get(&(id, pass_id)).cloned().ok_or(ProtocolError::StorageError)
     }
 
-    fn add_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>) {
+    async fn add_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>) -> ResultP<()> {
         self.0.insert((id, pass_id), pass);
+        Ok(())
     }
 
-    fn get_all_pass(&self, id: Uuid) -> ResultP<Vec<Vec<u8>>> {
+    async fn get_all_pass(&self, id: Uuid) -> ResultP<Vec<(Vec<u8>, Uuid)>> {
         let mut res = Vec::new();
         for (k, v) in &self.0 {
             if k.0 == id {
-                res.push(v.clone());
+                res.push((v.clone(), k.1));
             }
         }
         Ok(res)
     }
 
-    fn remove_pass(&mut self, id: Uuid, pass_id: Uuid) -> ResultP<()> {
+    async fn remove_pass(&mut self, id: Uuid, pass_id: Uuid) -> ResultP<()> {
         self.0.remove(&(id, pass_id)).ok_or(ProtocolError::StorageError).map(|_| ())
     }
 
-    fn update_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>) {
-        self.remove_pass(id, pass_id);
-        self.add_pass(id, pass_id, pass);
+    async fn update_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>) -> ResultP<()> {
+        self.remove_pass(id, pass_id).await?;
+        self.add_pass(id, pass_id, pass).await?;
+        Ok(())
     }
 }
 
@@ -196,15 +199,34 @@ impl Server<Secrets, Passes, Challenges> {
     }
 }
 
+impl Server<Secrets, PassesPostgres, Challenges> {
+    pub async fn new() -> ResultP<Self> {
+        let mut rng = SeedableRng::from_entropy();
+        let keypair = ky::keypair(&mut rng).map_err(|_| ProtocolError::CryptoError)?;
+        let ky_p = keypair.public;
+        let ky_q = keypair.secret;
+        let passes = PassesPostgres::new("host=localhost user=postgres").await.map_err(|_| ProtocolError::StorageError)?;
+        Ok(Server {
+            data: Vec::new(),
+            rng,
+            challenges: Challenges(HashMap::new()),
+            secrets: Secrets(HashMap::new()),
+            passes,
+            ky_p,
+            ky_q
+        })
+    }
+}
+
 impl<T: SecretsT, U: PassesT, D: ChallengesT> Server<T, U, D> {
-    pub fn add_user(&mut self, ck: CK) -> ResultP<Uuid> {
+    pub async fn add_user(&mut self, ck: CK) -> ResultP<Uuid> {
         let mut ck = ck.clone();
         ck.set_id();
         self.data.push(ck.clone());
         Ok(ck.id.unwrap())
     }
 
-    pub fn get_user(&self, id: Uuid) -> ResultP<CK> {
+    pub async fn get_user(&self, id: Uuid) -> ResultP<CK> {
         for ck in &self.data {
             if ck.id == Some(id) {
                 return Ok(ck.clone());
@@ -213,19 +235,19 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT> Server<T, U, D> {
         Err(ProtocolError::StorageError)
     }
     
-    pub fn challenge(&mut self, id: Uuid) -> ResultP<[u8; 32]> {
+    pub async fn challenge(&mut self, id: Uuid) -> ResultP<[u8; 32]> {
         let mut challenge = [0u8; 32];
         self.rng.fill_bytes(&mut challenge);
-        let _ = self.get_user(id)?;
+        let _ = self.get_user(id).await?;
         self.challenges.add_challenge(id ,challenge);
         Ok(challenge)
     }
 
-    pub fn verify(&self, id: Uuid, signature: &[u8]) -> ResultP<()> {
+    pub async fn verify(&self, id: Uuid, signature: &[u8]) -> ResultP<()> {
         if signature.len() != di::SIGNBYTES {
             return Err(ProtocolError::AuthError);
         }
-        let ck = self.get_user(id)?;
+        let ck = self.get_user(id).await?;
         let challenge = self.challenges.get_challenge(id)?;
         let verify = ck.di_p.to_di().verify(&challenge, &signature);
         if verify {
@@ -235,22 +257,22 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT> Server<T, U, D> {
         }
     }
 
-    pub fn sync(&mut self, id: Uuid) -> ResultP<[u8; KYBER_CIPHERTEXTBYTES]> {
-        let ck = self.get_user(id)?;
+    pub async fn sync(&mut self, id: Uuid) -> ResultP<[u8; KYBER_CIPHERTEXTBYTES]> {
+        let ck = self.get_user(id).await?;
         let (ciphertext, secret) = ky::encapsulate(&ck.ky_p, &mut self.rng).map_err(|_| ProtocolError::CryptoError)?;
         self.secrets.add_secret(id, secret);
         Ok(ciphertext)
     }
 
-    pub fn send(&mut self, id: Uuid, pass_id: Uuid) -> ResultP<EP> {
-        let _ck = self.get_user(id)?;
+    pub async fn send(&mut self, id: Uuid, pass_id: Uuid) -> ResultP<EP> {
+        let _ck = self.get_user(id).await?;
         let secret = self.secrets.get_secret(id)?;
         let hash = hash(&secret);
         println!("hash: {:?} ", hash);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut self.rng);
-        let pass = self.passes.get_pass(id,pass_id)?;
+        let pass = self.passes.get_pass(id,pass_id).await?;
         let passs: EP = bincode::deserialize(&pass).unwrap();
         println!("ciphertext: {:?} ", passs.ciphertext);
         let ciphertext = cipher.encrypt(&nonce, passs.ciphertext.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
@@ -263,32 +285,32 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT> Server<T, U, D> {
         })
     }
 
-    pub fn send_all(&mut self, id: Uuid) -> ResultP<Vec<EP>> {
-        let _ = self.get_user(id)?;
+    pub async fn send_all(&mut self, id: Uuid) -> ResultP<Vec<(EP, Uuid)>> {
+        let _ = self.get_user(id).await?;
         let secret = self.secrets.get_secret(id)?;
         let hash = hash(&secret);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut self.rng);
-        let pass = self.passes.get_all_pass(id)?;
+        let pass = self.passes.get_all_pass(id).await?;
         let mut res = Vec::new();
         for p in pass {
-            let passs: EP = bincode::deserialize(&p).unwrap();
+            let passs: EP = bincode::deserialize(&p.0).unwrap();
             println!("ciphertext: {:?} ", passs.ciphertext);
             let ciphertext = cipher.encrypt(&nonce, passs.ciphertext.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
             println!("nonce 2: {:?} ", nonce);
             println!("nonce: {:?} ", passs.nonce);
-            res.push(EP {
+            res.push((EP {
                 ciphertext,
                 nonce: passs.nonce,
                 nonce2: Some(nonce.to_vec()),
-            });
+            }, p.1));
         }
         Ok(res)
     }
 
-    pub fn create_pass(&mut self, id: Uuid, pass: EP) -> ResultP<Uuid> {
-        let _ck = self.get_user(id)?;
+    pub async fn create_pass(&mut self, id: Uuid, pass: EP) -> ResultP<Uuid> {
+        let _ck = self.get_user(id).await?;
         let secret = self.secrets.get_secret(id)?;
         println!("create_pass before: {:?}", pass);
         let passb = bincode::serialize(&pass).map_err(|_| ProtocolError::DataError)?;
@@ -309,12 +331,12 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT> Server<T, U, D> {
             nonce2: None,
         };
         let bi= bincode::serialize(&ep).map_err(|_| ProtocolError::DataError)?;
-        self.passes.add_pass(id, id2, bi);
+        self.passes.add_pass(id, id2, bi).await?;
         Ok(id2)
     }
 
-    pub fn update_pass(&mut self, id: Uuid, passid: Uuid, pass: EP) -> ResultP<()> {
-        let _ck = self.get_user(id)?;
+    pub async fn update_pass(&mut self, id: Uuid, passid: Uuid, pass: EP) -> ResultP<()> {
+        let _ck = self.get_user(id).await?;
         let secret = self.secrets.get_secret(id)?;
         let passb = bincode::serialize(&pass).map_err(|_| ProtocolError::DataError)?;
         let hash = hash(&secret);
@@ -332,13 +354,13 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT> Server<T, U, D> {
             nonce2: None,
         };
         let bi= bincode::serialize(&ep).map_err(|_| ProtocolError::DataError)?;
-        self.passes.update_pass(id, passid, bi);
+        self.passes.update_pass(id, passid, bi).await?;
         Ok(())
     }
 
-    pub fn delete_pass(&mut self, id: Uuid, passid: Uuid) -> ResultP<()> {
-        let _ck = self.get_user(id)?;
-        self.passes.remove_pass(id, passid);
+    pub async fn delete_pass(&mut self, id: Uuid, passid: Uuid) -> ResultP<()> {
+        let _ck = self.get_user(id).await?;
+        self.passes.remove_pass(id, passid).await?;
         Ok(())
     }
 }

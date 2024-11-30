@@ -1,14 +1,18 @@
 use protocol::{Challenges, Passes, Password, Secrets, CK};
 use server::run;
 use std::io::Write;
+use postgres::PassesPostgres;
 
+mod postgres;
 mod client;
 mod protocol;
 mod server;
+mod database;
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut server = protocol::Server::<Secrets, Passes, Challenges>::new()?;
+    println!("server started");
     let mut client = protocol::Client::new()?;
     let ck = CK::new(client.ky_p, client.di_p.clone(), "hery.dannez@gmail.com".to_string());
     let z = bincode::serialize(&ck).map_err(|_| protocol::ProtocolError::DataError)?;
@@ -17,7 +21,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .create(true)
         .open("key")?;
     file.write_all(&z)?;
-    let uuid = server.add_user(ck)?;
+    let uuid = server.add_user(ck).await?;
     let encryptedbyclient = client.encrypt(Password {
         username: "username".to_string(),
         password: "password".to_string(),
@@ -28,14 +32,14 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } )?;
     println!("ciphertext : {:?}", encryptedbyclient.ciphertext);
     println!("nonce : {:?}", encryptedbyclient.nonce);
-    let challenge = server.challenge(uuid)?;
+    let challenge = server.challenge(uuid).await?;
     let signature = client.sign(&challenge);
-    server.verify(uuid, &signature)?;
-    let ciphertextsync = server.sync(uuid)?;
+    server.verify(uuid, &signature).await?;
+    let ciphertextsync = server.sync(uuid).await?;
     client.sync(&ciphertextsync)?;
     let ep = client.send(encryptedbyclient)?;
-    let id2 = server.create_pass(uuid, ep)?;
-    let r = server.send(uuid, id2)?;
+    let id2 = server.create_pass(uuid, ep).await?;
+    let r = server.send(uuid, id2).await?;
     let password = client.receive(r)?;
     println!("{:?}", password);
     use std::io::{stdin};
@@ -64,6 +68,9 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         let passwords = client::get_all(&client2, uuid, &mut client).await.unwrap();
         println!("{:?}", passwords);
+        for i in 0..passwords.len() {
+            client::delete_pass(&client2, uuid, passwords[i].1).await.unwrap();
+        }
     }
     Ok(())
 }
