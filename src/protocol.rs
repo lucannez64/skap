@@ -1,9 +1,13 @@
+use base64::Engine;
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use thiserror::Error;
 use blake3::hash;
 use crate::{database::PassesSureal, postgres::PassesPostgres};
 use chacha20poly1305::{aead::{generic_array::typenum::Unsigned, Aead, AeadCore, KeyInit, OsRng}, consts::U24, Key, KeySizeUser, XChaCha20Poly1305, XNonce};
-use std::{collections::HashMap};
+use bytes::BytesMut;
+use postgres_types::{accepts, to_sql_checked, FromSql, ToSql};
+use std::{collections::HashMap, io::Read};
+use std::io::Write;
 use std::fmt;
 use serde_with::{serde_as, Bytes};
 use serde::{Deserialize, Serialize, Deserializer};
@@ -11,6 +15,7 @@ use serde::de::{self, Visitor};
 use pqc_kyber::{self as ky, KYBER_CIPHERTEXTBYTES, KYBER_SSBYTES};
 use crystals_dilithium::dilithium5 as di;
 use uuid::Uuid;
+use crate::postgres::UsersPostgres;
 use sharks::{Sharks, Share};
 
 #[derive(Error, Debug)]
@@ -27,21 +32,70 @@ pub enum ProtocolError {
 
 pub type ResultP<T> = std::result::Result<T, ProtocolError>;
 
-pub type kyPublicKey = [u8; ky::KYBER_PUBLICKEYBYTES];
+#[serde_as]
+#[derive(Clone, Serialize, Deserialize, Debug, Copy)]
+pub struct kyPublicKey {
+    #[serde_as(as = "Bytes")]
+    pub bytes: [u8; ky::KYBER_PUBLICKEYBYTES],
+}
+
+
 pub type kySecretKey = [u8; ky::KYBER_SECRETKEYBYTES];
 
+impl<'a> FromSql<'a> for kyPublicKey {
+    fn from_sql(_ty: &postgres_types::Type, raw: &[u8]) -> Result<kyPublicKey, Box<dyn std::error::Error + Sync + Send>> {
+        let bt = postgres_protocol::types::bytea_from_sql(&raw);
+        let t = ky::PublicKey::try_from(bt)?;
+        let t = kyPublicKey { bytes: t };
+        Ok(t)
+    }
+
+    accepts!(BYTEA);
+}
+
+impl ToSql for kyPublicKey {
+    fn to_sql(&self, _ty: &postgres_types::Type, out: &mut BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        postgres_protocol::types::bytea_to_sql(&self.bytes, out);
+        Ok(postgres_types::IsNull::No)
+    }
+
+    accepts!(BYTEA);
+    to_sql_checked!();
+}
+
 #[serde_as]
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct diPublicKey {
     #[serde_as(as = "Bytes")]
     pub bytes: [u8; 2592],
 }
 
 #[serde_as]
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug, Copy)]
 pub struct diSecretKey {
     #[serde_as(as = "Bytes")]
     pub bytes: [u8; di::SECRETKEYBYTES],
+}
+
+impl<'a> FromSql<'a> for diPublicKey {
+    fn from_sql(_ty: &postgres_types::Type, raw: &[u8]) -> Result<diPublicKey, Box<dyn std::error::Error + Sync + Send>> {
+        let bt = postgres_protocol::types::bytea_from_sql(&raw);
+        let t = diPublicKey::from_di(di::PublicKey::from_bytes(&bt));
+        Ok(t)
+    }
+
+    accepts!(BYTEA);
+}
+
+impl ToSql for diPublicKey {
+    fn to_sql(&self, _ty: &postgres_types::Type, out: &mut BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        let bt = self.clone().to_di().bytes;
+        postgres_protocol::types::bytea_to_sql(&bt, out);
+        Ok(postgres_types::IsNull::No)
+    }
+
+    accepts!(BYTEA);
+    to_sql_checked!(); 
 }
 
 impl diPublicKey {
@@ -68,14 +122,12 @@ impl diSecretKey {
     }
 }
 
-#[serde_as]
-#[derive(Clone,Serialize, Deserialize)]
+#[derive(Clone,Serialize, Deserialize, postgres_types::ToSql, postgres_types::FromSql, Debug)]
 pub struct CK {
     pub email: String,
     pub id: Option<Uuid>,
-    #[serde_as(as = "Bytes")]
-    ky_p: kyPublicKey,
-    di_p: diPublicKey,
+    pub ky_p: kyPublicKey,
+    pub di_p: diPublicKey,
 }
 
 impl CK {
@@ -94,8 +146,8 @@ impl CK {
 }
 
 #[derive(Clone)]
-pub struct Server<T: SecretsT, U: PassesT,  D: ChallengesT> {
-    data: Vec<CK>,
+pub struct Server<T: SecretsT, U: PassesT,  D: ChallengesT, E: UsersT> {
+    users: E,
     rng: StdRng,
     challenges: D,
     secrets: T,
@@ -110,6 +162,33 @@ pub struct Passes(HashMap<(Uuid, Uuid), Vec<u8>>);
 
 pub struct Challenges(HashMap<Uuid, [u8; 32]>);
 
+pub struct Users(HashMap<Uuid, CK>);
+
+pub trait UsersT {
+    async fn get_user(&self, id: Uuid) -> ResultP<CK>;
+    async fn add_user(&mut self, id: Uuid, user: CK) -> ResultP<()>;
+    async fn remove_user(&mut self, id: Uuid) -> ResultP<()>;
+}
+
+impl Users {
+    pub fn new() -> Users {
+        Users(HashMap::new())
+    }
+}
+impl UsersT for Users {
+    async fn get_user(&self, id: Uuid) -> ResultP<CK> {
+        self.0.get(&id).cloned().ok_or(ProtocolError::StorageError)
+    }
+
+    async fn add_user(&mut self, id: Uuid, user: CK) -> ResultP<()> {
+        self.0.insert(id, user);
+        Ok(())
+    }
+
+    async fn remove_user(&mut self, id: Uuid) -> ResultP<()> {
+        self.0.remove(&id).ok_or(ProtocolError::StorageError).map(|_| ())
+    }
+}
 
 pub trait SecretsT {
     fn get_secret(&self, id: Uuid) -> ResultP<[u8; 32]>;
@@ -181,58 +260,54 @@ impl SecretsT for Secrets {
 }
 
 
-impl Server<Secrets, Passes, Challenges> {
+impl Server<Secrets, Passes, Challenges, Users> {
     pub fn new() -> ResultP<Self> {
         let mut rng = SeedableRng::from_entropy();
         let keypair = ky::keypair(&mut rng).map_err(|_| ProtocolError::CryptoError)?;
         let ky_p = keypair.public;
         let ky_q = keypair.secret;
         Ok(Server {
-            data: Vec::new(),
+            users: Users::new(),
             rng,
             challenges: Challenges(HashMap::new()),
             secrets: Secrets(HashMap::new()),
             passes: Passes(HashMap::new()),
-            ky_p,
+            ky_p: kyPublicKey {bytes: ky_p},
             ky_q
         })
     }
 }
 
-impl Server<Secrets, PassesPostgres, Challenges> {
-    pub async fn new() -> ResultP<Self> {
+impl Server<Secrets, PassesPostgres, Challenges, UsersPostgres> {
+    pub async fn new(postgres_url: &str, file: &str ) -> ResultP<Self> {
         let mut rng = SeedableRng::from_entropy();
         let keypair = ky::keypair(&mut rng).map_err(|_| ProtocolError::CryptoError)?;
         let ky_p = keypair.public;
         let ky_q = keypair.secret;
-        let passes = PassesPostgres::new("host=localhost user=postgres").await.map_err(|_| ProtocolError::StorageError)?;
+        let passes = PassesPostgres::new(postgres_url, file).await.map_err(|_| ProtocolError::StorageError)?;
+        let users = UsersPostgres::new(postgres_url, file).await.map_err(|_| ProtocolError::StorageError)?;
         Ok(Server {
-            data: Vec::new(),
+            users,
             rng,
             challenges: Challenges(HashMap::new()),
             secrets: Secrets(HashMap::new()),
             passes,
-            ky_p,
+            ky_p: kyPublicKey {bytes: ky_p},
             ky_q
         })
     }
 }
 
-impl<T: SecretsT, U: PassesT, D: ChallengesT> Server<T, U, D> {
-    pub async fn add_user(&mut self, ck: CK) -> ResultP<Uuid> {
-        let mut ck = ck.clone();
+impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
+    pub async fn add_user(&mut self, ck:&mut CK) -> ResultP<Uuid> {
         ck.set_id();
-        self.data.push(ck.clone());
-        Ok(ck.id.unwrap())
+        let id = ck.id.unwrap();
+        self.users.add_user(id.clone(), ck.clone()).await?; 
+        Ok(id)
     }
 
     pub async fn get_user(&self, id: Uuid) -> ResultP<CK> {
-        for ck in &self.data {
-            if ck.id == Some(id) {
-                return Ok(ck.clone());
-            }
-        }
-        Err(ProtocolError::StorageError)
+        self.users.get_user(id).await
     }
     
     pub async fn challenge(&mut self, id: Uuid) -> ResultP<[u8; 32]> {
@@ -259,7 +334,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT> Server<T, U, D> {
 
     pub async fn sync(&mut self, id: Uuid) -> ResultP<[u8; KYBER_CIPHERTEXTBYTES]> {
         let ck = self.get_user(id).await?;
-        let (ciphertext, secret) = ky::encapsulate(&ck.ky_p, &mut self.rng).map_err(|_| ProtocolError::CryptoError)?;
+        let (ciphertext, secret) = ky::encapsulate(&ck.ky_p.bytes, &mut self.rng).map_err(|_| ProtocolError::CryptoError)?;
         self.secrets.add_secret(id, secret);
         Ok(ciphertext)
     }
@@ -382,12 +457,51 @@ pub struct Password {
     pub otp: Option<String>,
 }
 
+#[serde_as]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Client {
     pub ky_p: kyPublicKey,
+    #[serde_as(as = "Bytes")]
     pub ky_q: kySecretKey,
     pub di_p: diPublicKey,
     pub di_q: diSecretKey,
     secret: Option<[u8; KYBER_SSBYTES]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientEx {
+    pub c: Client,
+    pub id: CK,
+}
+
+impl ClientEx {
+    pub fn new(c: &Client, ck: &CK) -> Self {
+        ClientEx {
+            c: c.clone(),
+            id: ck.clone(),
+        }
+    }
+
+    pub fn to_string(&self) -> String {
+        let a = bincode::serialize(&self).map_err(|_| ProtocolError::DataError).unwrap();
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(a)
+    }
+
+    pub fn to_file(&self, file_name: String) -> ResultP<()> {
+        let a = bincode::serialize(&self).map_err(|_| ProtocolError::DataError).unwrap();
+        let mut file = std::fs::File::create(file_name).map_err(|_| ProtocolError::DataError).unwrap();
+        file.write_all(&a).map_err(|_| ProtocolError::DataError).unwrap();
+        Ok(())
+    } 
+
+    pub fn from_file(file_name: String) -> ResultP<Self> {
+        let mut file = std::fs::File::open(file_name).map_err(|_| ProtocolError::DataError).unwrap();
+        let mut a = Vec::new();
+        file.read_to_end(&mut a).map_err(|_| ProtocolError::DataError).unwrap();
+        let c = bincode::deserialize(&a).map_err(|_| ProtocolError::DataError).unwrap();
+        Ok(c)
+    }
+
 }
 
 impl Client {
@@ -400,7 +514,7 @@ impl Client {
         let di_p = dikeypair.public;
         let di_q = dikeypair.secret;
         Ok(Client {
-            ky_p,
+            ky_p: kyPublicKey {bytes: ky_p},
             ky_q,
             di_p: diPublicKey::from_di(di_p),
             di_q: diSecretKey::from_di(di_q),
@@ -409,20 +523,13 @@ impl Client {
     }
 
     pub fn encrypt(&self, pass: Password) -> ResultP<EP> {
-        println!("encrypt: {:?}", pass);
         let passb = bincode::serialize(&pass).map_err(|_| ProtocolError::DataError)?;
-        println!("encrypt after");
         let hash = hash(&self.ky_q);
-        println!("hash: {:?} ", hash);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        println!("Xnonce: {:?} ", nonce);
         let ciphertext = cipher.encrypt(&nonce, passb.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
         let decip = cipher.decrypt(&nonce, ciphertext.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
-        println!("decip: {:?} ", decip);
-        println!("passb: {:?} ",passb);
-        println!("ciphertext: {:?} ", ciphertext);
         Ok(EP {
             ciphertext,
             nonce: nonce.to_vec(),
@@ -447,36 +554,26 @@ impl Client {
     pub fn receive(&self, ep: EP) -> ResultP<Password> {
         let secret = self.secret.clone().ok_or(ProtocolError::CryptoError)?;
         let hash = hash(&secret);
-        println!("hash: {:?} ", hash);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
-        println!("nonce2: {:?}", ep.nonce2);
         let nonce2 = ep.nonce2.clone().ok_or(ProtocolError::DataError)?;
         // NONCE 2
-        println!("receive after");
         // DECRYPT 
         let pass = cipher.decrypt(XNonce::from_slice(&nonce2), ep.ciphertext.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
-        println!("pass: {:?} ", pass);
         let ep = EP {
             ciphertext: pass,
             nonce: ep.nonce,
             nonce2: None,
         };
-        println!("ep: {:?} ", ep);
         self.decrypt(ep)
     }
 
     pub fn decrypt(&self, ep: EP) -> ResultP<Password> {
         let hash = hash(&self.ky_q);
-        println!("hash: {:?} ", hash);
         let key: Key = Key::clone_from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(&key);
-        println!("nonce: {:?} ", ep.nonce);
-        println!("ciphertext: {:?} ", ep.ciphertext);
-        println!("XNonce: {:?} ", XNonce::from_slice(&ep.nonce));
         let pass = cipher.decrypt(XNonce::from_slice(&ep.nonce),ep.ciphertext.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
         let pass: Password = bincode::deserialize(&pass).map_err(|_| ProtocolError::DataError)?;
-        println!("pass: {:?} ", pass);
         Ok(pass)
     }
 

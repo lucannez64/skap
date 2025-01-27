@@ -1,14 +1,28 @@
-use tokio_postgres::{NoTls, Error};
+use std::fs::File;
 
-use crate::protocol::{PassesT, ProtocolError, ResultP};
+use tokio_postgres::{Error, NoTls};
+use tokio_postgres_tls::MakeRustlsConnect;
+use crate::{database, protocol::{PassesT, ProtocolError, ResultP, UsersT}};
 
 pub struct Database {
     pool: tokio_postgres::Client,
 }
 
 impl Database {
-    pub async fn new(url: &str) -> Result<Database, Error> {
-        let (client, connection) = tokio_postgres::connect(url, NoTls).await?;
+    pub async fn new(url: &str, file: &str) -> Result<Database, Error> {
+        rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let ca_file = File::open(file).unwrap();
+        let mut reader = std::io::BufReader::new(ca_file);
+        let mut root_store = rustls::RootCertStore::empty();
+        let certs = rustls_pemfile::certs(&mut reader);
+        for cert in certs {
+            root_store.add(cert.map_err(|x| {eprintln!("{}", x); x}).unwrap()).unwrap();
+        }
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let tls = MakeRustlsConnect::new(config);
+        let (client, connection) = tokio_postgres::connect(url, tls).await.map_err(|x| {eprintln!("{}", x); x})?;
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 eprintln!("connection error: {}", e);
@@ -26,10 +40,57 @@ pub struct PassesPostgres {
     pub database: Database,
 }
 
+pub struct UsersPostgres {
+    pub database: Database,
+}
+
+impl UsersPostgres {
+    pub async fn new(url: &str, file: &str) -> Result<UsersPostgres, Error> {
+        Ok(UsersPostgres {
+            database: Database::new(url, file).await?,
+        })
+    }
+}
+
+impl UsersT for UsersPostgres {
+    async fn add_user(&mut self, id: uuid::Uuid, user: crate::protocol::CK) -> ResultP<()> {
+        let database = self.database.get().await;
+        database.query("INSERT INTO users (id, email, ky_public_key, di_public_key) VALUES ($1, $2, $3, $4)", &[&id, &user.email, &user.ky_p, &user.di_p]).await.map_err(|e| {
+            eprintln!("Error adding user: {}", e);
+            ProtocolError::StorageError
+        })?;
+        Ok(())
+    }
+
+    async fn get_user(&self, id: uuid::Uuid) -> ResultP<crate::protocol::CK> {
+        let database = self.database.get().await;
+        let row = database.query_one("SELECT email, ky_public_key, di_public_key FROM users WHERE id = $1", &[&id]).await.map_err(|e| {
+            eprintln!("Error getting user: {}", e);
+            ProtocolError::StorageError
+        })?;
+        let a = crate::protocol::CK{
+          email: row.get(0),
+          ky_p: row.get(1),
+          di_p: row.get(2),
+          id: None,
+        };
+        Ok(a)
+    }
+
+    async fn remove_user(&mut self, id: uuid::Uuid) -> ResultP<()> {
+        let database = self.database.get().await;
+        database.query("DELETE FROM users WHERE id = $1", &[&id]).await.map_err(|e| {
+            eprintln!("Error removing user: {}", e);
+            ProtocolError::StorageError
+        })?;
+        Ok(())
+    }
+}
+
 impl PassesPostgres {
-    pub async fn new(url: &str) -> Result<PassesPostgres, Error> {
+    pub async fn new(url: &str, file: &str) -> Result<PassesPostgres, Error> {    
         Ok(PassesPostgres {
-            database: Database::new(url).await?,
+            database: Database::new(url, file).await?,
         })
     }
 }

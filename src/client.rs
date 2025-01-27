@@ -3,14 +3,14 @@ use uuid::Uuid;
 
 const BASE_URL: &str = "http://127.0.0.1:3030/";
 
-pub async fn new(client2: &reqwest::Client , email: &str) -> Result<(Client, Uuid), reqwest::Error> {
+pub async fn new(client2: &reqwest::Client , email: &str) -> Result<(Client, CK), reqwest::Error> {
     let client = crate::protocol::Client::new().unwrap();
     let ck = CK::new(client.ky_p, client.di_p.clone(), "hery.dannez@gmail.com".to_string());
     let res = client2.post(BASE_URL.to_string()+"create_user/")
         .body(bincode::serialize(&ck).unwrap())
         .send()
         .await?;
-    Ok((client, bincode::deserialize::<Uuid>(&res.bytes().await?).unwrap()))
+    Ok((client, bincode::deserialize::<CK>(&res.bytes().await?).unwrap()))
 }
 
 pub async fn auth(client2: &reqwest::Client, uuid: Uuid, client: &mut Client) -> Result<(), reqwest::Error> {

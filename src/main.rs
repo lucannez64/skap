@@ -1,27 +1,29 @@
-use protocol::{Challenges, Passes, Password, Secrets, CK};
+use protocol::{Challenges, Passes, Password, Secrets, CK, Users};
 use server::run;
 use std::io::Write;
-use postgres::PassesPostgres;
+extern crate dotenv;
+use dotenv::dotenv;
 
 mod postgres;
 mod client;
 mod protocol;
+mod tui;
 mod server;
 mod database;
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut server = protocol::Server::<Secrets, Passes, Challenges>::new()?;
+/*     let mut server = protocol::Server::<Secrets, Passes, Challenges, Users>::new()?;
     println!("server started");
     let mut client = protocol::Client::new()?;
-    let ck = CK::new(client.ky_p, client.di_p.clone(), "hery.dannez@gmail.com".to_string());
+    let mut ck = CK::new(client.ky_p, client.di_p.clone(), "hery.dannez@gmail.com".to_string());
     let z = bincode::serialize(&ck).map_err(|_| protocol::ProtocolError::DataError)?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .open("key")?;
     file.write_all(&z)?;
-    let uuid = server.add_user(ck).await?;
+    let uuid = server.add_user(&mut ck).await?;
     let encryptedbyclient = client.encrypt(Password {
         username: "username".to_string(),
         password: "password".to_string(),
@@ -41,18 +43,22 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let id2 = server.create_pass(uuid, ep).await?;
     let r = server.send(uuid, id2).await?;
     let password = client.receive(r)?;
-    println!("{:?}", password);
+    println!("{:?}", password);*/
     use std::io::{stdin};
     println!("Please choose an option: ");
     let mut s=String::new();
     stdin().read_line(&mut s).expect("Did not enter a correct string");
     s = s.trim().to_string();
     if &s == "serv" {
+        dotenv().ok();
         run().await?;
     } else if &s == "client" {
-        let client2 = reqwest::Client::new();
+        tui::run_tui().await.unwrap();
+
+/*         let client2 = reqwest::Client::new();
         let email = "hery.dannez@gmail".to_string();
-        let (mut client, uuid) = client::new(&client2, &email).await.unwrap();
+        let (mut client, ck) = client::new(&client2, &email).await.unwrap();
+        let uuid = ck.id.ok_or(protocol::ProtocolError::DataError)?;
         client::auth(&client2, uuid, &mut client).await.unwrap();
         for i in 0..10 {
             client::create_pass(&client2, uuid, &mut client, Password {
@@ -70,7 +76,8 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{:?}", passwords);
         for i in 0..passwords.len() {
             client::delete_pass(&client2, uuid, passwords[i].1).await.unwrap();
-        }
+        } */
+
     }
     Ok(())
 }
