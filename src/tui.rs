@@ -108,7 +108,7 @@ struct Clipboard {
 impl Clipboard {
     #[cfg(not(target_os = "windows"))]
     fn set_contents(&self, contents: String) -> Result<(), String> {
-        let mut c = ClipboardContext::new().unwrap();
+        let mut c = ClipboardContext::new().map_err(|e| e.to_string())?;
         c.set_contents(contents).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -265,16 +265,19 @@ async fn handle_main_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
             if !app.logged_in {
                 app.entered_log = true;
             } else {
-                let passwords = jsonfile_to_vec(app.email_input.to_string()).unwrap();
-                if let Some(client) = &mut app.client {
-                    app.importing = true;
-                    app.importing_total = passwords.len();
-                    for password in passwords {
-                        if let Ok(uuid) = client::create_pass(client2, client.1.id.unwrap(), &mut client.0, password.clone()).await {
-                            app.password_list.items.push((password, uuid));
-                            app.importing_state += 1;
+                if let Ok(passwords) = jsonfile_to_vec(app.email_input.to_string()) {
+                    if let Some(client) = &mut app.client {
+                        app.importing = true;
+                        app.importing_total = passwords.len();
+                        for password in passwords {
+                            if let Ok(uuid) = client::create_pass(client2, client.1.id.unwrap(), &mut client.0, password.clone()).await {
+                                app.password_list.items.push((password, uuid));
+                                app.importing_state += 1;
+                            }
                         }
                     }
+                } else {
+                    app.error_message = Some("Failed to import passwords".to_string());
                 }
             }
         }
@@ -301,10 +304,14 @@ async fn handle_main_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
                 match try_create(client2, &app.email_input).await {
                     Ok((client, ck)) => {
                         let a = ClientEx::new(&client, &ck);
-                        a.to_file("client".to_string()).unwrap();
-                        app.client = Some((client, ck));
-                        app.logged_in = true;
-                        app.error_message = None;
+                        let w = a.to_file("client".to_string());
+                        if w.is_err() {
+                            app.error_message = Some("Failed to save client".to_string());
+                        } else {
+                            app.client = Some((client, ck));
+                            app.logged_in = true;
+                            app.error_message = None;
+                        }
                     }
                     Err(e) => app.error_message = Some(format!("Login failed: {:?}", e)),
                 }
@@ -355,11 +362,14 @@ async fn try_login(
     client2: &reqwest::Client,
     email: &str,
 ) -> Result<(crate::protocol::Client, protocol::CK), protocol::ProtocolError> {
-    let c = ClientEx::from_file(email.to_string()).unwrap();
-    let (mut client, ck) = (c.c, c.id);
-    let uuid = ck.id.unwrap();
-    client::auth(client2, uuid, &mut client).await.map_err(|_| protocol::ProtocolError::AuthError)?;
-    Ok((client, ck))
+    if let Ok(c) = ClientEx::from_file(email.to_string()) {
+        let (mut client, ck) = (c.c, c.id);
+        let uuid = ck.id.unwrap();
+        client::auth(client2, uuid, &mut client).await.map_err(|_| protocol::ProtocolError::AuthError)?;
+        Ok((client, ck))
+    } else {
+        Err(protocol::ProtocolError::AuthError)
+    }
 }
 
 async fn handle_add_screen(key: KeyCode, app: &mut App, client2: &reqwest::Client) {
@@ -463,7 +473,10 @@ async fn handle_view_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
         KeyCode::Char('c') => {
             if let Some(selected) = app.password_list.state.selected() {
                 let password = &app.password_list.items[selected].0.password;
-                app.ctx.set_contents(password.to_string()).unwrap();    
+                let x = app.ctx.set_contents(password.to_string());
+                if x.is_err() {
+                    app.error_message = Some("Failed to copy".to_string());
+                }
             } else if app.searching {
                 app.search.push('c');
             }
