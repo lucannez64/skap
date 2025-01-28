@@ -84,7 +84,7 @@ struct App {
     log_or_create: bool,
     entered_log: bool,
     editing_password_id: Option<Uuid>,
-    ctx: ClipboardContext,
+    ctx: Clipboard,
     importing: bool,
     importing_state: usize,
     importing_total: usize,
@@ -93,6 +93,34 @@ struct App {
     filtered: StatefulList<(Password, Uuid)>,
 }
 
+#[cfg(not(target_os = "windows"))]
+struct Clipboard {
+    linux: Option<ClipboardContext>,
+    windows: Option<u64>,
+}
+
+#[cfg(target_os = "windows")]
+struct Clipboard {
+    windows: Option<u64>,
+    linux: Option<u64>,
+}
+
+impl Clipboard {
+    #[cfg(not(target_os = "windows"))]
+    fn set_contents(&self, contents: String) -> Result<(), String> {
+        self.linux.unwrap().set_contents(contents).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn set_contents(&self, contents: String) -> Result<(), String> {
+        use clipboard_win::{Clipboard, Setter};
+        clipboard_win::set_clipboard_string(&contents).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 impl App {
     fn new() -> Self {
         Self {
@@ -122,7 +150,48 @@ impl App {
             log_or_create: false,
             entered_log: false,
             editing_password_id: None,
-            ctx: ClipboardContext::new().unwrap(),
+            ctx: Clipboard{linux: Some(ClipboardContext::new().unwrap()), windows: None},
+            importing: false,
+            importing_state: 0,
+            importing_total: 0,
+            searching: false,
+            search: String::new(),
+            filtered: StatefulList::with_items(Vec::new()),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl App {
+    fn new() -> Self {
+        Self {
+            current_screen: CurrentScreen::Main,
+            email_input: String::new(),
+            password_list: StatefulList::with_items(Vec::new()),
+            new_password: Password {
+                username: String::new(),
+                password: String::new(),
+                app_id: None,
+                description: None,
+                url: Some(String::new()),
+                otp: Some(String::new()),
+            },
+            edit_password: Password {
+                username: String::new(),
+                password: String::new(),
+                app_id: None,
+                description: None,
+                url: Some(String::new()),
+                otp: None,
+            },
+            error_message: None,
+            client: None,
+            logged_in: false,
+            current_field: 0,
+            log_or_create: false,
+            entered_log: false,
+            editing_password_id: None,
+            ctx: Clipboard{linux: None, windows: Some(0)},
             importing: false,
             importing_state: 0,
             importing_total: 0,
