@@ -95,7 +95,7 @@ struct App {
 
 #[cfg(not(target_os = "windows"))]
 struct Clipboard {
-    linux: Option<ClipboardContext>,
+    linux: Option<u64>,
     windows: Option<u64>,
 }
 
@@ -108,7 +108,8 @@ struct Clipboard {
 impl Clipboard {
     #[cfg(not(target_os = "windows"))]
     fn set_contents(&self, contents: String) -> Result<(), String> {
-        self.linux.unwrap().set_contents(contents).map_err(|e| e.to_string())?;
+        let mut c = ClipboardContext::new().unwrap();
+        c.set_contents(contents).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -150,7 +151,7 @@ impl App {
             log_or_create: false,
             entered_log: false,
             editing_password_id: None,
-            ctx: Clipboard{linux: Some(ClipboardContext::new().unwrap()), windows: None},
+            ctx: Clipboard{linux: Some(0), windows: None},
             importing: false,
             importing_state: 0,
             importing_total: 0,
@@ -436,7 +437,9 @@ async fn handle_view_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
             }
         },        
         KeyCode::Char('d') => {
-            if let Some(selected) = app.password_list.state.selected() {
+             if app.searching {
+                app.search.push('d');
+            } else if let Some(selected) = app.password_list.state.selected() {
                 let (_, uuid) = &app.password_list.items[selected];
                 if let Some(client) = &mut app.client {
                     if client::delete_pass(client2, client.1.id.unwrap(), *uuid).await.is_ok() {
@@ -445,18 +448,16 @@ async fn handle_view_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
                         app.error_message = Some("Failed to delete password".to_string());
                     }
                 }
-            } else if app.searching {
-                app.search.push('d');
-            }
+            } 
         }
         KeyCode::Char('e') => {
-            if let Some(selected) = app.password_list.state.selected() {
+            if app.searching {
+                app.search.push('e');
+            } else if let Some(selected) = app.password_list.state.selected() {
                 let (pass, uuid) = &app.password_list.items[selected];
                 app.edit_password = pass.clone();
                 app.editing_password_id = Some(*uuid);
                 app.current_screen = CurrentScreen::EditingPassword;
-            } else if app.searching {
-                app.search.push('e');
             }
         }
         KeyCode::Char('c') => {
@@ -468,14 +469,14 @@ async fn handle_view_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
             }
         }
         KeyCode::Char('o') => {
-            if let Some(selected) = app.password_list.state.selected() {
+            if app.searching {
+                app.search.push('o');
+            } else if let Some(selected) = app.password_list.state.selected() {
                 if app.password_list.items[selected].0.otp.is_some() {
                     let totp = otp(app.password_list.items[selected].0.otp.as_ref().unwrap());
                     app.ctx.set_contents(totp.generate().to_string()).unwrap();
                 }
 
-            } else if app.searching {
-                app.search.push('o');
             }
         }
         KeyCode::Char('/') => {
