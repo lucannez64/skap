@@ -3,7 +3,7 @@ use rand::{rngs::StdRng, RngCore, SeedableRng};
 use thiserror::Error;
 use blake3::hash;
 use crate::{database::PassesSureal, postgres::PassesPostgres};
-use chacha20poly1305::{aead::{generic_array::typenum::Unsigned, Aead, AeadCore, KeyInit, OsRng}, consts::U24, Key, KeySizeUser, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::{aead::{generic_array::typenum::Unsigned, Aead, AeadCore, Buffer, KeyInit, OsRng}, consts::U24, Key, KeySizeUser, XChaCha20Poly1305, XNonce};
 use bytes::BytesMut;
 use postgres_types::{accepts, to_sql_checked, FromSql, ToSql};
 use std::{collections::HashMap, io::Read};
@@ -465,7 +465,7 @@ pub struct Client {
     pub ky_q: kySecretKey,
     pub di_p: diPublicKey,
     pub di_q: diSecretKey,
-    secret: Option<[u8; KYBER_SSBYTES]>,
+    pub secret: Option<[u8; KYBER_SSBYTES]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -498,6 +498,10 @@ impl ClientEx {
         let mut file = std::fs::File::open(file_name).map_err(|_| ProtocolError::DataError).unwrap();
         let mut a = Vec::new();
         file.read_to_end(&mut a).map_err(|_| ProtocolError::DataError).unwrap();
+        if a.len() >= 1568 {
+            let mut b = a[1568..].to_vec();
+            println!("a: {:?} ", b);
+        }
         let c = bincode::deserialize(&a).map_err(|_| ProtocolError::DataError).unwrap();
         Ok(c)
     }

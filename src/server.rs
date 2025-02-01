@@ -354,13 +354,12 @@ async fn sync_json_map(uui: String, server2: & Arc<Mutex<Server2<Secrets, Passes
 }
 async fn create_user_map(body: bytes::Bytes, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     match bincode::deserialize::<CK>(&body) {
-        Ok(ck) => {
-            let mut ck2 = ck.clone();
+        Ok(mut ck) => {
             let mut server = server2.lock().await;
-            match server.add_user(&mut ck2).await {
+            match server.add_user(&mut ck).await {
                 Ok(uuid) => {
                     println!("User created with uuid {} && name {}", uuid, ck.email); 
-                    Ok(warp::reply::Response::new(bincode::serialize(&ck2).unwrap().into()))
+                    Ok(warp::reply::Response::new(bincode::serialize(&ck).unwrap().into()))
                 },
                 Err(_) => Ok(warp::reply::Response::new(bincode::serialize(&"INTERNAL_SERVER_ERROR").unwrap().into()))
             }
@@ -369,13 +368,12 @@ async fn create_user_map(body: bytes::Bytes, server2: & Arc<Mutex<Server2<Secret
     }
 }
 
-async fn create_user_json_map(ck: CK, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
-    let mut ck2 = ck.clone();
+async fn create_user_json_map(mut ck: CK, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     let mut server = server2.lock().await;
-    match server.add_user(&mut ck2).await {
+    match server.add_user(&mut ck).await {
         Ok(uuid) => {
             println!("User created with uuid {} && name {}", uuid, ck.email); 
-            Ok(warp::reply::json(&ck2))
+            Ok(warp::reply::json(&ck))
         },
         Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR"))
     }

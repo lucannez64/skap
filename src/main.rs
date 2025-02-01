@@ -1,4 +1,4 @@
-use protocol::{Challenges, Passes, Password, Secrets, CK, Users};
+use protocol::{Challenges, ClientEx, Passes, Password, Secrets, Users, CK};
 use server::run;
 use std::io::Write;
 extern crate dotenv;
