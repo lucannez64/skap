@@ -48,22 +48,22 @@ pub type ResultP<T> = std::result::Result<T, ProtocolError>;
 
 #[serde_as]
 #[derive(Clone, Serialize, Deserialize, Debug, Copy)]
-pub struct kyPublicKey {
+pub struct KyPublicKey {
     #[serde_as(as = "Bytes")]
     pub bytes: [u8; KYBER_PUBLICKEYBYTES],
 }
 
-pub type kySecretKey = [u8; KYBER_SECRETKEYBYTES];
+pub type KySecretKey = [u8; KYBER_SECRETKEYBYTES];
 
 #[cfg(feature = "server")]
-impl<'a> FromSql<'a> for kyPublicKey {
+impl<'a> FromSql<'a> for KyPublicKey {
     fn from_sql(
         _ty: &postgres_types::Type,
         raw: &[u8],
-    ) -> Result<kyPublicKey, Box<dyn std::error::Error + Sync + Send>> {
+    ) -> Result<KyPublicKey, Box<dyn std::error::Error + Sync + Send>> {
         let bt = postgres_protocol::types::bytea_from_sql(&raw);
         let t = MlKem1024PublicKey::try_from(bt)?;
-        let t = kyPublicKey {
+        let t = KyPublicKey {
             bytes: *t.as_slice(),
         };
         Ok(t)
@@ -72,8 +72,8 @@ impl<'a> FromSql<'a> for kyPublicKey {
     accepts!(BYTEA);
 }
 
-impl From<kyPublicKey> for MlKem1024PublicKey {
-    fn from(t: kyPublicKey) -> Self {
+impl From<KyPublicKey> for MlKem1024PublicKey {
+    fn from(t: KyPublicKey) -> Self {
         let k: [u8; KYBER_PUBLICKEYBYTES] = t.bytes;
         MlKem1024PublicKey::from(k)
     }
@@ -87,7 +87,7 @@ fn random_array<const L: usize>() -> [u8; L] {
 }
 
 #[cfg(feature = "server")]
-impl ToSql for kyPublicKey {
+impl ToSql for KyPublicKey {
     fn to_sql(
         &self,
         _ty: &postgres_types::Type,
@@ -103,26 +103,26 @@ impl ToSql for kyPublicKey {
 
 #[serde_as]
 #[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct diPublicKey {
+pub struct DiPublicKey {
     #[serde_as(as = "Bytes")]
     pub bytes: [u8; 2592],
 }
 
 #[serde_as]
 #[derive(Clone, Serialize, Deserialize, Debug, Copy)]
-pub struct diSecretKey {
+pub struct DiSecretKey {
     #[serde_as(as = "Bytes")]
     pub bytes: [u8; di::SECRETKEYBYTES],
 }
 
 #[cfg(feature = "server")]
-impl<'a> FromSql<'a> for diPublicKey {
+impl<'a> FromSql<'a> for DiPublicKey {
     fn from_sql(
         _ty: &postgres_types::Type,
         raw: &[u8],
-    ) -> Result<diPublicKey, Box<dyn std::error::Error + Sync + Send>> {
+    ) -> Result<DiPublicKey, Box<dyn std::error::Error + Sync + Send>> {
         let bt = postgres_protocol::types::bytea_from_sql(&raw);
-        let t = diPublicKey::from_di(di::PublicKey::from_bytes(&bt));
+        let t = DiPublicKey::from_di(di::PublicKey::from_bytes(&bt));
         Ok(t)
     }
 
@@ -130,7 +130,7 @@ impl<'a> FromSql<'a> for diPublicKey {
 }
 
 #[cfg(feature = "server")]
-impl ToSql for diPublicKey {
+impl ToSql for DiPublicKey {
     fn to_sql(
         &self,
         _ty: &postgres_types::Type,
@@ -145,9 +145,9 @@ impl ToSql for diPublicKey {
     to_sql_checked!();
 }
 
-impl diPublicKey {
+impl DiPublicKey {
     fn from_di(pb: di::PublicKey) -> Self {
-        diPublicKey { bytes: pb.bytes }
+        DiPublicKey { bytes: pb.bytes }
     }
 
     fn to_di(self) -> di::PublicKey {
@@ -155,9 +155,9 @@ impl diPublicKey {
     }
 }
 
-impl diSecretKey {
+impl DiSecretKey {
     fn from_di(pb: di::SecretKey) -> Self {
-        diSecretKey { bytes: pb.bytes }
+        DiSecretKey { bytes: pb.bytes }
     }
 
     fn to_di(self) -> di::SecretKey {
@@ -173,12 +173,12 @@ impl diSecretKey {
 pub struct CK {
     pub email: String,
     pub id: Option<Uuid>,
-    pub ky_p: kyPublicKey,
-    pub di_p: diPublicKey,
+    pub ky_p: KyPublicKey,
+    pub di_p: DiPublicKey,
 }
 
 impl CK {
-    pub fn new(ky_p: kyPublicKey, di_p: diPublicKey, email: String) -> CK {
+    pub fn new(ky_p: KyPublicKey, di_p: DiPublicKey, email: String) -> CK {
         CK {
             email,
             id: None,
@@ -501,11 +501,11 @@ pub struct Password {
 #[serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Client {
-    pub ky_p: kyPublicKey,
+    pub ky_p: KyPublicKey,
     #[serde_as(as = "Bytes")]
-    pub ky_q: kySecretKey,
-    pub di_p: diPublicKey,
-    pub di_q: diSecretKey,
+    pub ky_q: KySecretKey,
+    pub di_p: DiPublicKey,
+    pub di_q: DiSecretKey,
     pub secret: Option<[u8; KYBER_SSBYTES]>,
 }
 
@@ -568,10 +568,10 @@ impl Client {
         let di_p = dikeypair.public;
         let di_q = dikeypair.secret;
         Ok(Client {
-            ky_p: kyPublicKey { bytes: ky_p },
+            ky_p: KyPublicKey { bytes: ky_p },
             ky_q,
-            di_p: diPublicKey::from_di(di_p),
-            di_q: diSecretKey::from_di(di_q),
+            di_p: DiPublicKey::from_di(di_p),
+            di_q: DiSecretKey::from_di(di_q),
             secret: None,
         })
     }

@@ -1,12 +1,12 @@
-use std::fs::File;
+use std::{fs::File, str::FromStr};
 
 use crate::protocol::{PassesT, ProtocolError, ResultP, UsersT};
-use lazy_static::lazy_static;
-use tokio_postgres::{Error, NoTls};
+use tokio_postgres::Error;
+use deadpool_postgres::{tokio_postgres, GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod};
 use tokio_postgres_tls::MakeRustlsConnect;
 
 pub struct Database {
-    pool: tokio_postgres::Client,
+    pool: Pool,
 }
 
 impl Database {
@@ -31,20 +31,20 @@ impl Database {
             .with_root_certificates(root_store)
             .with_no_client_auth();
         let tls = MakeRustlsConnect::new(config);
-        let (client, connection) = tokio_postgres::connect(url, tls).await.map_err(|x| {
-            eprintln!("{}", x);
-            x
-        })?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("connection error: {}", e);
-            }
-        });
-        Ok(Database { pool: client })
+        let confiz = tokio_postgres::Config::from_str(url)?;
+        let mgr_config = ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        };
+        let mgr = Manager::from_config(confiz, tls, mgr_config);
+        let pool = Pool::builder(mgr).max_size(16).build().unwrap();
+        Ok(Database { pool })
     }
 
-    pub async fn get(&self) -> &tokio_postgres::Client {
-        &self.pool
+    pub async fn get(&self) -> Result<deadpool_postgres::Object, ProtocolError> {
+        self.pool.get().await.map_err(|e| {
+            eprintln!("Error getting connection: {}", e);
+            ProtocolError::StorageError
+        })
     }
 }
 
@@ -66,8 +66,12 @@ impl UsersPostgres {
 
 impl UsersT for UsersPostgres {
     async fn add_user(&mut self, id: uuid::Uuid, user: crate::protocol::CK) -> ResultP<()> {
-        let database = self.database.get().await;
-        database.query("INSERT INTO users (id, email, ky_public_key, di_public_key) VALUES ($1, $2, $3, $4)", &[&id, &user.email, &user.ky_p, &user.di_p]).await.map_err(|e| {
+        let database = self.database.get().await?;
+        let stmt = database.prepare_cached("INSERT INTO users (id, email, ky_public_key, di_public_key) VALUES ($1, $2, $3, $4)").await.map_err(|e| {
+            eprintln!("Error adding user: {}", e);
+            ProtocolError::StorageError
+        })?;
+        database.query(&stmt, &[&id, &user.email, &user.ky_p, &user.di_p]).await.map_err(|e| {
             eprintln!("Error adding user: {}", e);
             ProtocolError::StorageError
         })?;
@@ -75,10 +79,14 @@ impl UsersT for UsersPostgres {
     }
 
     async fn get_user(&self, id: uuid::Uuid) -> ResultP<crate::protocol::CK> {
-        let database = self.database.get().await;
+        let database = self.database.get().await?;
+        let stmt = database.prepare_cached("SELECT email, ky_public_key, di_public_key FROM users WHERE id = $1").await.map_err(|e| {
+            eprintln!("Error getting user: {}", e);
+            ProtocolError::StorageError
+        })?;
         let row = database
             .query_one(
-                "SELECT email, ky_public_key, di_public_key FROM users WHERE id = $1",
+                &stmt,
                 &[&id],
             )
             .await
@@ -96,7 +104,7 @@ impl UsersT for UsersPostgres {
     }
 
     async fn remove_user(&mut self, id: uuid::Uuid) -> ResultP<()> {
-        let database = self.database.get().await;
+        let database = self.database.get().await?;
         database
             .query("DELETE FROM users WHERE id = $1", &[&id])
             .await
@@ -123,10 +131,14 @@ impl PassesT for PassesPostgres {
         pass_id: uuid::Uuid,
         pass: Vec<u8>,
     ) -> ResultP<()> {
-        let database = self.database.get().await;
+        let database = self.database.get().await?;
+        let stmt = database.prepare_cached("INSERT INTO passes (id, user_id, data) VALUES ($2, $1, $3)").await.map_err(|e| {
+            eprintln!("Error adding pass: {}", e);
+            ProtocolError::StorageError
+        })?;
         database
             .query(
-                "INSERT INTO passes (id, user_id, data) VALUES ($2, $1, $3)",
+                &stmt,
                 &[&id, &pass_id, &pass],
             )
             .await
@@ -138,10 +150,14 @@ impl PassesT for PassesPostgres {
     }
 
     async fn get_pass(&self, id: uuid::Uuid, pass_id: uuid::Uuid) -> ResultP<Vec<u8>> {
-        let database = self.database.get().await;
+        let database = self.database.get().await?;
+        let stmt = database.prepare_cached("SELECT data FROM passes WHERE id = $2 AND user_id = $1").await.map_err(|e| {
+            eprintln!("Error getting pass: {}", e);
+            ProtocolError::StorageError
+        })?;
         let row = database
             .query_one(
-                "SELECT data FROM passes WHERE id = $2 AND user_id = $1",
+                &stmt,
                 &[&id, &pass_id],
             )
             .await
@@ -154,7 +170,7 @@ impl PassesT for PassesPostgres {
     }
 
     async fn remove_pass(&mut self, id: uuid::Uuid, pass_id: uuid::Uuid) -> ResultP<()> {
-        let database = self.database.get().await;
+        let database = self.database.get().await?;
         database
             .query(
                 "DELETE FROM passes WHERE id = $2 AND user_id = $1",
@@ -174,7 +190,7 @@ impl PassesT for PassesPostgres {
         pass_id: uuid::Uuid,
         pass: Vec<u8>,
     ) -> ResultP<()> {
-        let database = self.database.get().await;
+        let database = self.database.get().await?;
         database
             .query(
                 "UPDATE passes SET data = $3 WHERE id = $2 AND user_id = $1",
@@ -189,9 +205,13 @@ impl PassesT for PassesPostgres {
     }
 
     async fn get_all_pass(&self, id: uuid::Uuid) -> ResultP<Vec<(Vec<u8>, uuid::Uuid)>> {
-        let database = self.database.get().await;
+        let database = self.database.get().await?;
+        let stmt = database.prepare_cached("SELECT data, id FROM passes WHERE user_id = $1").await.map_err(|e| {
+            eprintln!("Error getting all pass: {}", e);
+            ProtocolError::StorageError
+        })?;
         let rows = database
-            .query("SELECT data, id FROM passes WHERE user_id = $1", &[&id])
+            .query(&stmt, &[&id])
             .await
             .map_err(|e| {
                 eprintln!("Error getting all pass: {}", e);
