@@ -3,6 +3,16 @@ name = "skap"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "skap-server"
+path = "src/binner.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "skap-tui"
+path = "src/bitui.rs"
+required-features = ["tui"]
+
 [features]
 tui = ["client", "dep:ratatui", "dep:crossterm", "dep:totp-rs", "dep:clipboard-win", "dep:cli-clipboard", "dep:otp-std"]
 server = ["dep:warp", "dep:tokio-postgres-tls", "dep:tokio-postgres", "dep:postgres-types", "dep:postgres-protocol", "dep:rustls", "dep:rustls-pemfile", "dep:rustls-rustcrypto",]

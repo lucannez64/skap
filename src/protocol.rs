@@ -1,30 +1,35 @@
 use base64::Engine;
+use blake3::hash;
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use thiserror::Error;
-use blake3::hash;
 
 #[cfg(feature = "server")]
 use crate::postgres::PassesPostgres;
-use chacha20poly1305::{aead::{Aead, AeadCore, KeyInit, OsRng}, Key, XChaCha20Poly1305, XNonce};
-use bytes::BytesMut;
-#[cfg(feature = "server")]
-use postgres_types::{accepts, to_sql_checked, FromSql, ToSql};
-use std::{collections::HashMap, io::Read};
-use std::io::Write;
-use std::fmt;
-use serde_with::{serde_as, Bytes};
-use serde::{Deserialize, Serialize, Deserializer};
-use serde::de::{self, Visitor};
-use crystals_dilithium::dilithium5 as di;
-use uuid::Uuid;
 #[cfg(feature = "server")]
 use crate::postgres::UsersPostgres;
-use sharks::{Sharks, Share};
-use libcrux_ml_kem::mlkem1024::{self, MlKem1024Ciphertext, MlKem1024PrivateKey, MlKem1024PublicKey};
+use bytes::BytesMut;
+use chacha20poly1305::{
+    aead::{Aead, AeadCore, KeyInit, OsRng},
+    Key, XChaCha20Poly1305, XNonce,
+};
+use crystals_dilithium::dilithium5 as di;
+use libcrux_ml_kem::mlkem1024::{
+    self, MlKem1024Ciphertext, MlKem1024PrivateKey, MlKem1024PublicKey,
+};
+#[cfg(feature = "server")]
+use postgres_types::{accepts, to_sql_checked, FromSql, ToSql};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_with::{serde_as, Bytes};
+use sharks::{Share, Sharks};
+use std::fmt;
+use std::io::Write;
+use std::{collections::HashMap, io::Read};
+use uuid::Uuid;
 
 const KYBER_PUBLICKEYBYTES: usize = 1568;
 const KYBER_CIPHERTEXTBYTES: usize = 1568;
-const KYBER_SSBYTES: usize = 32; 
+const KYBER_SSBYTES: usize = 32;
 const KYBER_SECRETKEYBYTES: usize = 3168;
 
 #[derive(Error, Debug)]
@@ -48,15 +53,19 @@ pub struct kyPublicKey {
     pub bytes: [u8; KYBER_PUBLICKEYBYTES],
 }
 
-
 pub type kySecretKey = [u8; KYBER_SECRETKEYBYTES];
 
 #[cfg(feature = "server")]
 impl<'a> FromSql<'a> for kyPublicKey {
-    fn from_sql(_ty: &postgres_types::Type, raw: &[u8]) -> Result<kyPublicKey, Box<dyn std::error::Error + Sync + Send>> {
+    fn from_sql(
+        _ty: &postgres_types::Type,
+        raw: &[u8],
+    ) -> Result<kyPublicKey, Box<dyn std::error::Error + Sync + Send>> {
         let bt = postgres_protocol::types::bytea_from_sql(&raw);
         let t = MlKem1024PublicKey::try_from(bt)?;
-        let t = kyPublicKey { bytes: *t.as_slice() };
+        let t = kyPublicKey {
+            bytes: *t.as_slice(),
+        };
         Ok(t)
     }
 
@@ -71,15 +80,19 @@ impl From<kyPublicKey> for MlKem1024PublicKey {
 }
 
 fn random_array<const L: usize>() -> [u8; L] {
-     let mut rng = OsRng;
-     let mut seed = [0; L];
-     rng.try_fill_bytes(&mut seed).unwrap();
-     seed
+    let mut rng = OsRng;
+    let mut seed = [0; L];
+    rng.try_fill_bytes(&mut seed).unwrap();
+    seed
 }
 
 #[cfg(feature = "server")]
 impl ToSql for kyPublicKey {
-    fn to_sql(&self, _ty: &postgres_types::Type, out: &mut BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+    fn to_sql(
+        &self,
+        _ty: &postgres_types::Type,
+        out: &mut BytesMut,
+    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
         postgres_protocol::types::bytea_to_sql(&self.bytes, out);
         Ok(postgres_types::IsNull::No)
     }
@@ -104,7 +117,10 @@ pub struct diSecretKey {
 
 #[cfg(feature = "server")]
 impl<'a> FromSql<'a> for diPublicKey {
-    fn from_sql(_ty: &postgres_types::Type, raw: &[u8]) -> Result<diPublicKey, Box<dyn std::error::Error + Sync + Send>> {
+    fn from_sql(
+        _ty: &postgres_types::Type,
+        raw: &[u8],
+    ) -> Result<diPublicKey, Box<dyn std::error::Error + Sync + Send>> {
         let bt = postgres_protocol::types::bytea_from_sql(&raw);
         let t = diPublicKey::from_di(di::PublicKey::from_bytes(&bt));
         Ok(t)
@@ -115,21 +131,23 @@ impl<'a> FromSql<'a> for diPublicKey {
 
 #[cfg(feature = "server")]
 impl ToSql for diPublicKey {
-    fn to_sql(&self, _ty: &postgres_types::Type, out: &mut BytesMut) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+    fn to_sql(
+        &self,
+        _ty: &postgres_types::Type,
+        out: &mut BytesMut,
+    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
         let bt = self.clone().to_di().bytes;
         postgres_protocol::types::bytea_to_sql(&bt, out);
         Ok(postgres_types::IsNull::No)
     }
 
     accepts!(BYTEA);
-    to_sql_checked!(); 
+    to_sql_checked!();
 }
 
 impl diPublicKey {
     fn from_di(pb: di::PublicKey) -> Self {
-        diPublicKey {
-            bytes: pb.bytes
-        }
+        diPublicKey { bytes: pb.bytes }
     }
 
     fn to_di(self) -> di::PublicKey {
@@ -139,9 +157,7 @@ impl diPublicKey {
 
 impl diSecretKey {
     fn from_di(pb: di::SecretKey) -> Self {
-        diSecretKey {
-            bytes: pb.bytes
-        }
+        diSecretKey { bytes: pb.bytes }
     }
 
     fn to_di(self) -> di::SecretKey {
@@ -149,8 +165,11 @@ impl diSecretKey {
     }
 }
 
-#[cfg_attr(feature = "server", derive(postgres_types::ToSql, postgres_types::FromSql))]
-#[derive(Clone,Serialize, Deserialize, Debug)]
+#[cfg_attr(
+    feature = "server",
+    derive(postgres_types::ToSql, postgres_types::FromSql)
+)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct CK {
     pub email: String,
     pub id: Option<Uuid>,
@@ -174,7 +193,7 @@ impl CK {
 }
 
 #[derive(Clone)]
-pub struct Server<T: SecretsT, U: PassesT,  D: ChallengesT, E: UsersT> {
+pub struct Server<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> {
     users: E,
     rng: StdRng,
     challenges: D,
@@ -212,7 +231,10 @@ impl UsersT for Users {
     }
 
     async fn remove_user(&mut self, id: Uuid) -> ResultP<()> {
-        self.0.remove(&id).ok_or(ProtocolError::StorageError).map(|_| ())
+        self.0
+            .remove(&id)
+            .ok_or(ProtocolError::StorageError)
+            .map(|_| ())
     }
 }
 
@@ -246,7 +268,10 @@ pub trait PassesT {
 
 impl PassesT for Passes {
     async fn get_pass(&self, id: Uuid, pass_id: Uuid) -> ResultP<Vec<u8>> {
-        self.0.get(&(id, pass_id)).cloned().ok_or(ProtocolError::StorageError)
+        self.0
+            .get(&(id, pass_id))
+            .cloned()
+            .ok_or(ProtocolError::StorageError)
     }
 
     async fn add_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>) -> ResultP<()> {
@@ -265,7 +290,10 @@ impl PassesT for Passes {
     }
 
     async fn remove_pass(&mut self, id: Uuid, pass_id: Uuid) -> ResultP<()> {
-        self.0.remove(&(id, pass_id)).ok_or(ProtocolError::StorageError).map(|_| ())
+        self.0
+            .remove(&(id, pass_id))
+            .ok_or(ProtocolError::StorageError)
+            .map(|_| ())
     }
 
     async fn update_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>) -> ResultP<()> {
@@ -285,7 +313,6 @@ impl SecretsT for Secrets {
     }
 }
 
-
 impl Server<Secrets, Passes, Challenges, Users> {
     pub fn new() -> ResultP<Self> {
         let rng = SeedableRng::from_entropy();
@@ -300,10 +327,14 @@ impl Server<Secrets, Passes, Challenges, Users> {
 }
 #[cfg(feature = "server")]
 impl Server<Secrets, PassesPostgres, Challenges, UsersPostgres> {
-    pub async fn new(postgres_url: &str, file: &str ) -> ResultP<Self> {
+    pub async fn new(postgres_url: &str, file: &str) -> ResultP<Self> {
         let rng = SeedableRng::from_entropy();
-        let passes = PassesPostgres::new(postgres_url, file).await.map_err(|_| ProtocolError::StorageError)?;
-        let users = UsersPostgres::new(postgres_url, file).await.map_err(|_| ProtocolError::StorageError)?;
+        let passes = PassesPostgres::new(postgres_url, file)
+            .await
+            .map_err(|_| ProtocolError::StorageError)?;
+        let users = UsersPostgres::new(postgres_url, file)
+            .await
+            .map_err(|_| ProtocolError::StorageError)?;
         Ok(Server {
             users,
             rng,
@@ -315,22 +346,22 @@ impl Server<Secrets, PassesPostgres, Challenges, UsersPostgres> {
 }
 
 impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
-    pub async fn add_user(&mut self, ck:&mut CK) -> ResultP<Uuid> {
+    pub async fn add_user(&mut self, ck: &mut CK) -> ResultP<Uuid> {
         ck.set_id();
         let id = ck.id.unwrap();
-        self.users.add_user(id.clone(), ck.clone()).await?; 
+        self.users.add_user(id.clone(), ck.clone()).await?;
         Ok(id)
     }
 
     pub async fn get_user(&self, id: Uuid) -> ResultP<CK> {
         self.users.get_user(id).await
     }
-    
+
     pub async fn challenge(&mut self, id: Uuid) -> ResultP<[u8; 32]> {
         let mut challenge = [0u8; 32];
         self.rng.fill_bytes(&mut challenge);
         let _ = self.get_user(id).await?;
-        self.challenges.add_challenge(id ,challenge);
+        self.challenges.add_challenge(id, challenge);
         Ok(challenge)
     }
 
@@ -357,16 +388,18 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
         Ok(*ciphertext.as_slice())
     }
 
-    pub async fn send(&mut self, id: Uuid, pass_id: Uuid) -> ResultP<EP> {
+    pub async fn send(&self, id: Uuid, pass_id: Uuid) -> ResultP<EP> {
         let _ck = self.get_user(id).await?;
         let secret = self.secrets.get_secret(id)?;
         let hash = hash(&secret);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut self.rng);
-        let pass = self.passes.get_pass(id,pass_id).await?;
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let pass = self.passes.get_pass(id, pass_id).await?;
         let passs: EP = bincode::deserialize(&pass).unwrap();
-        let ciphertext = cipher.encrypt(&nonce, passs.ciphertext.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
+        let ciphertext = cipher
+            .encrypt(&nonce, passs.ciphertext.as_slice())
+            .map_err(|_| ProtocolError::CryptoError)?;
         Ok(EP {
             ciphertext,
             nonce: passs.nonce,
@@ -374,23 +407,28 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
         })
     }
 
-    pub async fn send_all(&mut self, id: Uuid) -> ResultP<Vec<(EP, Uuid)>> {
+    pub async fn send_all(&self, id: Uuid) -> ResultP<Vec<(EP, Uuid)>> {
         let _ = self.get_user(id).await?;
         let secret = self.secrets.get_secret(id)?;
         let hash = hash(&secret);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut self.rng);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let pass = self.passes.get_all_pass(id).await?;
         let mut res = Vec::new();
         for p in pass {
             let passs: EP = bincode::deserialize(&p.0).unwrap();
-            let ciphertext = cipher.encrypt(&nonce, passs.ciphertext.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
-            res.push((EP {
-                ciphertext,
-                nonce: passs.nonce,
-                nonce2: Some(nonce.to_vec()),
-            }, p.1));
+            let ciphertext = cipher
+                .encrypt(&nonce, passs.ciphertext.as_slice())
+                .map_err(|_| ProtocolError::CryptoError)?;
+            res.push((
+                EP {
+                    ciphertext,
+                    nonce: passs.nonce,
+                    nonce2: Some(nonce.to_vec()),
+                },
+                p.1,
+            ));
         }
         Ok(res)
     }
@@ -403,13 +441,15 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
         let nonce2 = pass.nonce2.clone().ok_or(ProtocolError::DataError)?;
-        let pass2 = cipher.decrypt(XNonce::from_slice(&nonce2), pass.ciphertext.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
+        let pass2 = cipher
+            .decrypt(XNonce::from_slice(&nonce2), pass.ciphertext.as_slice())
+            .map_err(|_| ProtocolError::CryptoError)?;
         let ep = EP {
             ciphertext: pass2,
             nonce: pass.nonce,
             nonce2: None,
         };
-        let bi= bincode::serialize(&ep).map_err(|_| ProtocolError::DataError)?;
+        let bi = bincode::serialize(&ep).map_err(|_| ProtocolError::DataError)?;
         self.passes.add_pass(id, id2, bi).await?;
         Ok(id2)
     }
@@ -421,13 +461,15 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
         let nonce2 = pass.nonce2.clone().ok_or(ProtocolError::DataError)?;
-        let pass2 = cipher.decrypt(XNonce::from_slice(&nonce2), pass.ciphertext.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
+        let pass2 = cipher
+            .decrypt(XNonce::from_slice(&nonce2), pass.ciphertext.as_slice())
+            .map_err(|_| ProtocolError::CryptoError)?;
         let ep = EP {
             ciphertext: pass2,
             nonce: pass.nonce,
             nonce2: None,
         };
-        let bi= bincode::serialize(&ep).map_err(|_| ProtocolError::DataError)?;
+        let bi = bincode::serialize(&ep).map_err(|_| ProtocolError::DataError)?;
         self.passes.update_pass(id, passid, bi).await?;
         Ok(())
     }
@@ -482,25 +524,38 @@ impl ClientEx {
     }
 
     pub fn to_string(&self) -> String {
-        let a = bincode::serialize(&self).map_err(|_| ProtocolError::DataError).unwrap();
+        let a = bincode::serialize(&self)
+            .map_err(|_| ProtocolError::DataError)
+            .unwrap();
         base64::engine::general_purpose::STANDARD_NO_PAD.encode(a)
     }
 
     pub fn to_file(&self, file_name: String) -> ResultP<()> {
-        let a = bincode::serialize(&self).map_err(|_| ProtocolError::DataError).unwrap();
-        let mut file = std::fs::File::create(file_name).map_err(|_| ProtocolError::DataError).unwrap();
-        file.write_all(&a).map_err(|_| ProtocolError::DataError).unwrap();
+        let a = bincode::serialize(&self)
+            .map_err(|_| ProtocolError::DataError)
+            .unwrap();
+        let mut file = std::fs::File::create(file_name)
+            .map_err(|_| ProtocolError::DataError)
+            .unwrap();
+        file.write_all(&a)
+            .map_err(|_| ProtocolError::DataError)
+            .unwrap();
         Ok(())
-    } 
-
-    pub fn from_file(file_name: String) -> ResultP<Self> {
-        let mut file = std::fs::File::open(file_name).map_err(|_| ProtocolError::DataError).unwrap();
-        let mut a = Vec::new();
-        file.read_to_end(&mut a).map_err(|_| ProtocolError::DataError).unwrap();
-        let c = bincode::deserialize(&a).map_err(|_| ProtocolError::DataError).unwrap();
-        Ok(c)
     }
 
+    pub fn from_file(file_name: String) -> ResultP<Self> {
+        let mut file = std::fs::File::open(file_name)
+            .map_err(|_| ProtocolError::DataError)
+            .unwrap();
+        let mut a = Vec::new();
+        file.read_to_end(&mut a)
+            .map_err(|_| ProtocolError::DataError)
+            .unwrap();
+        let c = bincode::deserialize(&a)
+            .map_err(|_| ProtocolError::DataError)
+            .unwrap();
+        Ok(c)
+    }
 }
 
 impl Client {
@@ -513,7 +568,7 @@ impl Client {
         let di_p = dikeypair.public;
         let di_q = dikeypair.secret;
         Ok(Client {
-            ky_p: kyPublicKey {bytes: ky_p},
+            ky_p: kyPublicKey { bytes: ky_p },
             ky_q,
             di_p: diPublicKey::from_di(di_p),
             di_q: diSecretKey::from_di(di_q),
@@ -527,7 +582,9 @@ impl Client {
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let ciphertext = cipher.encrypt(&nonce, passb.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
+        let ciphertext = cipher
+            .encrypt(&nonce, passb.as_slice())
+            .map_err(|_| ProtocolError::CryptoError)?;
         Ok(EP {
             ciphertext,
             nonce: nonce.to_vec(),
@@ -541,7 +598,9 @@ impl Client {
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
         let nonce2 = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let ciphertext = cipher.encrypt(&nonce2, ep.ciphertext.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
+        let ciphertext = cipher
+            .encrypt(&nonce2, ep.ciphertext.as_slice())
+            .map_err(|_| ProtocolError::CryptoError)?;
         Ok(EP {
             ciphertext,
             nonce: ep.nonce,
@@ -556,8 +615,10 @@ impl Client {
         let cipher = XChaCha20Poly1305::new(key);
         let nonce2 = ep.nonce2.clone().ok_or(ProtocolError::DataError)?;
         // NONCE 2
-        // DECRYPT 
-        let pass = cipher.decrypt(XNonce::from_slice(&nonce2), ep.ciphertext.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
+        // DECRYPT
+        let pass = cipher
+            .decrypt(XNonce::from_slice(&nonce2), ep.ciphertext.as_slice())
+            .map_err(|_| ProtocolError::CryptoError)?;
         let ep = EP {
             ciphertext: pass,
             nonce: ep.nonce,
@@ -570,13 +631,15 @@ impl Client {
         let hash = hash(&self.ky_q);
         let key: Key = Key::clone_from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(&key);
-        let pass = cipher.decrypt(XNonce::from_slice(&ep.nonce),ep.ciphertext.as_slice()).map_err(|_| ProtocolError::CryptoError)?;
+        let pass = cipher
+            .decrypt(XNonce::from_slice(&ep.nonce), ep.ciphertext.as_slice())
+            .map_err(|_| ProtocolError::CryptoError)?;
         let pass: Password = bincode::deserialize(&pass).map_err(|_| ProtocolError::DataError)?;
         Ok(pass)
     }
 
     pub fn sign(&self, challenge: &[u8]) -> [u8; crystals_dilithium::dilithium5::SIGNBYTES] {
-        di::SecretKey::sign(&self.di_q.clone().to_di(), challenge)    
+        di::SecretKey::sign(&self.di_q.clone().to_di(), challenge)
     }
 
     pub fn sync(&mut self, ciphertextsync: &[u8]) -> ResultP<()> {
@@ -627,7 +690,8 @@ impl<'de> Deserialize<'de> for Shard {
             {
                 // Assuming Share can be constructed from a byte slice
                 //
-                let data: Share = Share::try_from(v).map_err(|_| de::Error::invalid_length(v.len(), &self) )?;
+                let data: Share =
+                    Share::try_from(v).map_err(|_| de::Error::invalid_length(v.len(), &self))?;
                 Ok(Shard { data })
             }
         }
@@ -642,20 +706,22 @@ pub struct Shards {
 }
 
 impl Shards {
-    pub fn new(ret_num: u8,secret: &[u8]) -> Shards {
+    pub fn new(ret_num: u8, secret: &[u8]) -> Shards {
         let shards = Sharks(3);
         let dealer = shards.dealer(secret);
-        let data = dealer.take(ret_num.into()).map(|x| Shard{data: x}).collect();
-        Shards {
-            data
-        }
+        let data = dealer
+            .take(ret_num.into())
+            .map(|x| Shard { data: x })
+            .collect();
+        Shards { data }
     }
 
     pub fn recover(self) -> ResultP<Vec<u8>> {
         let shards = Sharks(3);
         let slice: Vec<Share> = self.data.iter().map(|x| x.data.clone()).collect();
-        let secret = shards.recover(&slice).map_err(|_| ProtocolError::CryptoError);
+        let secret = shards
+            .recover(&slice)
+            .map_err(|_| ProtocolError::CryptoError);
         secret
     }
 }
-
