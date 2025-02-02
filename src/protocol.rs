@@ -357,6 +357,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
             ciphertext,
             nonce: passs.nonce,
             nonce2: Some(nonce.to_vec()),
+            shared: passs.shared,
         })
     }
 
@@ -379,6 +380,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
                 ciphertext,
                 nonce: passs.nonce,
                 nonce2: Some(nonce.to_vec()),
+                shared: passs.shared,
             }, p.1));
         }
         Ok(res)
@@ -404,6 +406,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
             ciphertext: pass2,
             nonce: pass.nonce,
             nonce2: None,
+            shared: pass.shared
         };
         let bi= bincode::serialize(&ep).map_err(|_| ProtocolError::DataError)?;
         self.passes.add_pass(id, id2, bi).await?;
@@ -427,6 +430,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
             ciphertext: pass2,
             nonce: pass.nonce,
             nonce2: None,
+            shared: pass.shared
         };
         let bi= bincode::serialize(&ep).map_err(|_| ProtocolError::DataError)?;
         self.passes.update_pass(id, passid, bi).await?;
@@ -445,6 +449,7 @@ pub struct EP {
     pub ciphertext: Vec<u8>,
     pub nonce: Vec<u8>,
     nonce2: Option<Vec<u8>>,
+    shared: Option<Vec<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -455,6 +460,7 @@ pub struct Password {
     pub description: Option<String>,
     pub url: Option<String>,
     pub otp: Option<String>,
+    pub shares: Option<Vec<Uuid>>,
 }
 
 #[serde_as]
@@ -499,7 +505,7 @@ impl ClientEx {
         let mut a = Vec::new();
         file.read_to_end(&mut a).map_err(|_| ProtocolError::DataError).unwrap();
         if a.len() >= 1568 {
-            let mut b = a[1568..].to_vec();
+            let b = a[1568..].to_vec();
             println!("a: {:?} ", b);
         }
         let c = bincode::deserialize(&a).map_err(|_| ProtocolError::DataError).unwrap();
@@ -526,7 +532,32 @@ impl Client {
         })
     }
 
+    pub fn encrypt_shared(&self, pass:Password, pks: Vec<kyPublicKey>) -> ResultP<EP> {
+        if pks.len() != pass.shares.as_ref().unwrap().len() {
+            return Err(ProtocolError::CryptoError);
+        }
+        if pass.shares.is_none() {
+            return Err(ProtocolError::CryptoError);
+        }
+        let mut ss: [u8; 32] = [0u8; 32];
+        OsRng.fill_bytes(&mut ss);
+        let mut shared = Vec::new();
+        for pk in pks {
+            let (ciphertext, _) = ky::encapsulate(&pk.bytes, &mut OsRng).map_err(|_| ProtocolError::CryptoError)?;
+            shared.push(s);
+        }
+        let passb = bincode::serialize(&pass).map_err(|_| ProtocolError::DataError)?;
+    }
+
     pub fn encrypt(&self, pass: Password) -> ResultP<EP> {
+        if pass.shares.is_some() {
+            let ss = &mut OsRng.gen::<[u8; 32]>();
+            for s in pass.shares.as_mut().unwrap() {
+                
+                ky::encapsulate(, rng)c
+            }
+        
+        }
         let passb = bincode::serialize(&pass).map_err(|_| ProtocolError::DataError)?;
         let hash = hash(&self.ky_q);
         let key: &Key = Key::from_slice(hash.as_bytes());
@@ -538,6 +569,7 @@ impl Client {
             ciphertext,
             nonce: nonce.to_vec(),
             nonce2: None,
+            shared: None,
         })
     }
 
@@ -552,6 +584,7 @@ impl Client {
             ciphertext,
             nonce: ep.nonce,
             nonce2: Some(nonce2.to_vec()),
+            shared: ep.shared,
         })
     }
 
@@ -568,6 +601,7 @@ impl Client {
             ciphertext: pass,
             nonce: ep.nonce,
             nonce2: None,
+            shared: ep.shared,
         };
         self.decrypt(ep)
     }
