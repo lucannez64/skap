@@ -94,16 +94,9 @@ struct App {
 }
 
 #[cfg(not(target_os = "windows"))]
-struct Clipboard {
-    linux: Option<u64>,
-    windows: Option<u64>,
-}
-
+struct Clipboard();
 #[cfg(target_os = "windows")]
-struct Clipboard {
-    windows: Option<u64>,
-    linux: Option<u64>,
-}
+struct Clipboard();
 
 impl Clipboard {
     #[cfg(not(target_os = "windows"))]
@@ -151,7 +144,7 @@ impl App {
             log_or_create: false,
             entered_log: false,
             editing_password_id: None,
-            ctx: Clipboard{linux: Some(0), windows: None},
+            ctx: Clipboard(),
             importing: false,
             importing_state: 0,
             importing_total: 0,
@@ -192,7 +185,7 @@ impl App {
             log_or_create: false,
             entered_log: false,
             editing_password_id: None,
-            ctx: Clipboard{linux: None, windows: Some(0)},
+            ctx: Clipboard(),
             importing: false,
             importing_state: 0,
             importing_total: 0,

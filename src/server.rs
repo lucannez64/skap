@@ -1,7 +1,6 @@
 use warp::Filter;
 use crate::postgres::UsersPostgres;
 use crate::protocol::Challenges;
-use crate::protocol::Passes;
 use crate::postgres::PassesPostgres;
 use crate::protocol::Secrets;
 use crate::protocol::EP;

@@ -1,15 +1,22 @@
-use protocol::{Challenges, ClientEx, Passes, Password, Secrets, Users, CK};
+#[cfg(feature = "server")]
 use server::run;
-use std::io::Write;
+#[cfg(feature = "server")]
 extern crate dotenv;
+#[cfg(feature = "server")]
 use dotenv::dotenv;
 
-mod postgres;
-mod client;
+
 mod protocol;
+
+#[cfg(feature = "server")]
+mod postgres;
+#[cfg(feature = "tui")]
+mod client;
+
+#[cfg(feature = "tui")]
 mod tui;
+#[cfg(feature = "server")]
 mod server;
-mod database;
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -44,16 +51,8 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let r = server.send(uuid, id2).await?;
     let password = client.receive(r)?;
     println!("{:?}", password);*/
-    use std::io::{stdin};
-    println!("Please choose an option: ");
-    let mut s=String::new();
-    stdin().read_line(&mut s).expect("Did not enter a correct string");
-    s = s.trim().to_string();
-    if &s == "serv" {
-        dotenv().ok();
-        run().await?;
-    } else if &s == "client" {
-        tui::run_tui().await.unwrap();
+
+    runer().await
 
 /*         let client2 = reqwest::Client::new();
         let email = "hery.dannez@gmail".to_string();
@@ -78,6 +77,23 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             client::delete_pass(&client2, uuid, passwords[i].1).await.unwrap();
         } */
 
-    }
+}
+
+#[cfg(feature = "server")]
+async fn runer() -> Result<(), Box<dyn std::error::Error>> {
+    dotenv().ok();
+    run().await?;
+
+    Ok(())
+}
+
+#[cfg(feature = "tui")]
+async fn runer() -> Result<(), Box<dyn std::error::Error>> {
+    tui::run_tui().await.unwrap();
+    Ok(())
+}
+
+#[cfg(not(any(feature = "server", feature = "tui")))]
+async fn runer() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }

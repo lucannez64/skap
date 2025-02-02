@@ -2,7 +2,7 @@ use std::fs::File;
 
 use tokio_postgres::{Error, NoTls};
 use tokio_postgres_tls::MakeRustlsConnect;
-use crate::{database, protocol::{PassesT, ProtocolError, ResultP, UsersT}};
+use crate::protocol::{PassesT, ProtocolError, ResultP, UsersT};
 
 pub struct Database {
     pool: tokio_postgres::Client,
@@ -10,7 +10,7 @@ pub struct Database {
 
 impl Database {
     pub async fn new(url: &str, file: &str) -> Result<Database, Error> {
-        rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
+        let _ = rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider());
         let ca_file = File::open(file).unwrap();
         let mut reader = std::io::BufReader::new(ca_file);
         let mut root_store = rustls::RootCertStore::empty();
