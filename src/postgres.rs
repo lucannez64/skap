@@ -1,7 +1,7 @@
 use std::{fs::File, str::FromStr};
 
 use crate::protocol::{PassesT, ProtocolError, ResultP, UsersT};
-use tokio_postgres::{Error, NoTls};
+use tokio_postgres::Error;
 use deadpool_postgres::{tokio_postgres, GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod};
 use tokio_postgres_tls::MakeRustlsConnect;
 
