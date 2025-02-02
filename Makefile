@@ -5,10 +5,16 @@ release:
 	cargo +nightly build -Zbuild-std --release 
 
 server:
-	cargo +nightly build -Zbuild-std --release --features server && ./target/release/skap
+	rm -f target/release/skap && rm -f target/release/skap-server && cargo +nightly build -Zbuild-std --release --features server && mv -f target/release/skap target/release/skap-server
 
 tui:
-	cargo +nightly build -Zbuild-std --release --features tui
+	rm -f target/release/skap && rm -f target/release/skap-tui && cargo +nightly build -Zbuild-std --release --features tui && mv -f target/release/skap target/release/skap-tui
+
+run-server: server
+	./target/release/skap-server
+
+run-tui: tui
+	./target/release/skap-tui
 
 clean:
 	cargo clean

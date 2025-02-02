@@ -123,7 +123,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(warp::body::json())
         .and(server_filter.clone())
-        .and_then(|uui: String, body: bytes::Bytes, server2: Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>| {
+        .and_then(|uui: String, body: Vec<u8>, server2: Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>| {
             async move {verify_json_map(uui, body, &server2).await}
         });
 
@@ -202,9 +202,12 @@ async fn delete_map(uui: String, uui2: String, server2: & Arc<Mutex<Server2<Secr
 
 async fn delete_json_map(uui: String, uui2: String, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     let mut server = server2.lock().await;
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
-    let uui2 = uuid::Uuid::parse_str(&uui2).unwrap();
-    match server.delete_pass(id, uui2).await {
+    let id = uuid::Uuid::parse_str(&uui);
+    let uui2 = uuid::Uuid::parse_str(&uui2);
+    if id.is_err() || uui2.is_err() {
+        return Ok(warp::reply::json(&"BAD_REQUEST"));
+    }
+    match server.delete_pass(id.unwrap(), uui2.unwrap()).await {
         Ok(()) => {
             Ok(warp::reply::json(&"OK"))
         },
@@ -214,8 +217,11 @@ async fn delete_json_map(uui: String, uui2: String, server2: & Arc<Mutex<Server2
 
 async fn challenge_map(uui: String, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     let mut server = server2.lock().await;
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
-    match server.challenge(id).await {
+    let id = uuid::Uuid::parse_str(&uui);
+    if id.is_err() {
+        return Ok(warp::reply::Response::new(bincode::serialize(&"BAD_REQUEST").unwrap().into()));
+    }
+    match server.challenge(id.unwrap()).await {
         Ok(challenge) => {
             Ok(warp::reply::Response::new(bincode::serialize(&challenge).unwrap().into()))
         },
@@ -225,8 +231,11 @@ async fn challenge_map(uui: String, server2: & Arc<Mutex<Server2<Secrets, Passes
 
 async fn challenge_json_map(uui: String, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     let mut server = server2.lock().await;
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
-    match server.challenge(id).await {
+    let id = uuid::Uuid::parse_str(&uui);
+    if id.is_err() {
+        return Ok(warp::reply::json(&"BAD_REQUEST"));
+    }
+    match server.challenge(id.unwrap()).await {
         Ok(challenge) => {
             Ok(warp::reply::json(&challenge))
         },
@@ -236,8 +245,11 @@ async fn challenge_json_map(uui: String, server2: & Arc<Mutex<Server2<Secrets, P
 
 async fn verify_map(uui: String, body: bytes::Bytes, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     let server = server2.lock().await;
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
-    match server.verify(id, &body).await {
+    let id = uuid::Uuid::parse_str(&uui);
+    if id.is_err() {
+        return Ok(warp::reply::Response::new(bincode::serialize(&"BAD_REQUEST").unwrap().into()));
+    }
+    match server.verify(id.unwrap(), &body).await {
         Ok(r) => {
             Ok(warp::reply::Response::new(bincode::serialize(&r).unwrap().into()))
         },
@@ -245,10 +257,13 @@ async fn verify_map(uui: String, body: bytes::Bytes, server2: & Arc<Mutex<Server
     }
 }
 
-async fn verify_json_map(uui: String, body: bytes::Bytes, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
+async fn verify_json_map(uui: String, body: Vec<u8>, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     let server = server2.lock().await;
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
-    match server.verify(id, &body).await {
+    let id = uuid::Uuid::parse_str(&uui);
+    if id.is_err() {
+        return Ok(warp::reply::json(&"BAD_REQUEST"));
+    }
+    match server.verify(id.unwrap(),body.as_slice()).await {
         Ok(r) => {
             Ok(warp::reply::json(&r))
         },
@@ -258,10 +273,14 @@ async fn verify_json_map(uui: String, body: bytes::Bytes, server2: & Arc<Mutex<S
 
 async fn update_pass_map(uui: String, uui2: String, pass: bytes::Bytes, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     let mut server = server2.lock().await;
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
-    let id2 = uuid::Uuid::parse_str(&uui2).unwrap();
-    let ep =bincode::deserialize::<EP>(&pass).unwrap();
-    match server.update_pass(id, id2, ep).await {
+    let id = uuid::Uuid::parse_str(&uui);
+    let id2 = uuid::Uuid::parse_str(&uui2);
+    let ep =bincode::deserialize::<EP>(&pass);
+    if id.is_err() || id2.is_err() || ep.is_err() {
+        return Ok(warp::reply::Response::new(bincode::serialize(&"BAD_REQUEST").unwrap().into()));
+    }
+    let id2 = id2.unwrap();
+    match server.update_pass(id.unwrap(), id2, ep.unwrap()).await {
     Ok(()) => {
         Ok(warp::reply::Response::new(bincode::serialize(&id2).unwrap().into()))
     },
@@ -271,9 +290,16 @@ async fn update_pass_map(uui: String, uui2: String, pass: bytes::Bytes, server2:
 
 async fn update_pass_json_map(uui: String, uui2: String, pass: EP, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     let mut server = server2.lock().await;
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
-    let id2 = uuid::Uuid::parse_str(&uui2).unwrap();
-    match server.update_pass(id, id2, pass).await {
+    let id = uuid::Uuid::parse_str(&uui);
+    if id.is_err() {
+        return Ok(warp::reply::json(&"BAD_REQUEST"));
+    }
+    let id2 = uuid::Uuid::parse_str(&uui2);
+    if id2.is_err() {
+        return Ok(warp::reply::json(&"BAD_REQUEST"));
+    }
+    let id2 = id2.unwrap();
+    match server.update_pass(id.unwrap(), id2, pass).await {
     Ok(()) => {
         Ok(warp::reply::json(&id2))
     },
@@ -283,9 +309,12 @@ async fn update_pass_json_map(uui: String, uui2: String, pass: EP, server2: & Ar
 
 async fn send_map(uui: String, uui2: String, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     let mut server = server2.lock().await;
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
-    let id2 = uuid::Uuid::parse_str(&uui2).unwrap();
-    match server.send(id, id2).await {
+    let id = uuid::Uuid::parse_str(&uui);
+    let id2 = uuid::Uuid::parse_str(&uui2);
+    if id.is_err() || id2.is_err() {
+        return Ok(warp::reply::Response::new(bincode::serialize(&"BAD_REQUEST").unwrap().into()));
+    }
+    match server.send(id.unwrap(), id2.unwrap()).await {
     Ok(r) => {
         Ok(warp::reply::Response::new(bincode::serialize(&r).unwrap().into()))
     },
@@ -295,9 +324,12 @@ async fn send_map(uui: String, uui2: String, server2: & Arc<Mutex<Server2<Secret
 
 async fn send_json_map(uui: String, uui2: String, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     let mut server = server2.lock().await;
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
-    let id2 = uuid::Uuid::parse_str(&uui2).unwrap();
-    match server.send(id, id2).await {
+    let id = uuid::Uuid::parse_str(&uui);
+    let id2 = uuid::Uuid::parse_str(&uui2);
+    if id.is_err() || id2.is_err() {
+        return Ok(warp::reply::json(&"BAD_REQUEST"));
+    }
+    match server.send(id.unwrap(), id2.unwrap()).await {
     Ok(r) => {
         Ok(warp::reply::json(&r))
     },
@@ -307,9 +339,12 @@ async fn send_json_map(uui: String, uui2: String, server2: & Arc<Mutex<Server2<S
 
 async fn create_pass_map(uui: String,pass: bytes::Bytes, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     let mut server = server2.lock().await;
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
-    let ep =bincode::deserialize::<EP>(&pass).unwrap();
-    match server.create_pass(id, ep).await {
+    let id = uuid::Uuid::parse_str(&uui);
+    let ep =bincode::deserialize::<EP>(&pass);
+    if id.is_err() || ep.is_err() {
+        return Ok(warp::reply::Response::new(bincode::serialize(&"BAD_REQUEST").unwrap().into()));
+    }
+    match server.create_pass(id.unwrap(), ep.unwrap()).await {
         Ok(id2) => {
             Ok(warp::reply::Response::new(bincode::serialize(&id2).unwrap().into()))
         },
@@ -320,8 +355,11 @@ async fn create_pass_map(uui: String,pass: bytes::Bytes, server2: & Arc<Mutex<Se
 
 async fn create_pass_json_map(uui: String,pass: EP, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     let mut server = server2.lock().await;
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
-    match server.create_pass(id, pass).await {
+    let id = uuid::Uuid::parse_str(&uui);
+    if id.is_err() {
+        return Ok(warp::reply::json(&"BAD_REQUEST"));
+    }
+    match server.create_pass(id.unwrap(), pass).await {
         Ok(id2) => {
             Ok(warp::reply::json(&id2))
         },
@@ -331,8 +369,11 @@ async fn create_pass_json_map(uui: String,pass: EP, server2: & Arc<Mutex<Server2
 
 async fn sync_map(uui: String, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     let mut server = server2.lock().await;
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
-    match server.sync(id).await {
+    let id = uuid::Uuid::parse_str(&uui);
+    if id.is_err() {
+        return Ok(warp::reply::Response::new(bincode::serialize(&"BAD_REQUEST").unwrap().into()));
+    }
+    match server.sync(id.unwrap()).await {
         Ok(ciphertextsync) => {
             Ok(warp::reply::Response::new(ciphertextsync.to_vec().into()))
         },
@@ -343,8 +384,11 @@ async fn sync_map(uui: String, server2: & Arc<Mutex<Server2<Secrets, PassesPostg
 
 async fn sync_json_map(uui: String, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
     let mut server = server2.lock().await;
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
-    match server.sync(id).await {
+    let id = uuid::Uuid::parse_str(&uui);
+    if id.is_err() {
+        return Ok(warp::reply::json(&"BAD_REQUEST"));
+    }
+    match server.sync(id.unwrap()).await {
         Ok(ciphertextsync) => {
             Ok(warp::reply::json(&ciphertextsync.to_vec()))
         },
@@ -379,9 +423,12 @@ async fn create_user_json_map(mut ck: CK, server2: & Arc<Mutex<Server2<Secrets, 
 }
 
 async fn send_all_map(uui: String, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
+    let id = uuid::Uuid::parse_str(&uui);
+    if id.is_err() {
+        return Ok(warp::reply::Response::new(bincode::serialize(&"BAD_REQUEST").unwrap().into()));
+    }
     let mut server = server2.lock().await;
-    match server.send_all(id).await {
+    match server.send_all(id.unwrap()).await {
         Ok(r) => {
             Ok(warp::reply::Response::new(bincode::serialize(&r).unwrap().into()))
         },
@@ -390,9 +437,12 @@ async fn send_all_map(uui: String, server2: & Arc<Mutex<Server2<Secrets, PassesP
 }
 
 async fn send_all_json_map(uui: String, server2: & Arc<Mutex<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>) -> Result<impl warp::Reply, Infallible> {
-    let id = uuid::Uuid::parse_str(&uui).unwrap();
+    let id = uuid::Uuid::parse_str(&uui);
+    if id.is_err() {
+        return Ok(warp::reply::json(&"BAD_REQUEST"));
+    }
     let mut server = server2.lock().await;
-    match server.send_all(id).await {
+    match server.send_all(id.unwrap()).await {
         Ok(r) => {
             Ok(warp::reply::json(&r))
         },
