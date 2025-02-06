@@ -2,6 +2,7 @@ use crate::postgres::PassesPostgres;
 use crate::postgres::UsersPostgres;
 use crate::protocol::Challenges;
 use crate::protocol::Secrets;
+use crate::protocol::Sessions;
 use crate::protocol::Server as Server2;
 use crate::protocol::CK;
 use crate::protocol::EP;
@@ -17,13 +18,13 @@ struct ErrorMessage {
     message: String,
 }
 
-pub type ServerArc = Arc<RwLock<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>;
+pub type ServerArc = Arc<RwLock<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres, Sessions>>>;
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let ca = std::env::var("CA_FILE").expect("CA must be set");
     let server2 = Arc::new(RwLock::new(
-        Server2::<Secrets, PassesPostgres, Challenges, UsersPostgres>::new(&database_url, &ca)
+        Server2::<Secrets, PassesPostgres, Challenges, UsersPostgres, Sessions>::new(&database_url, &ca)
             .await
             .unwrap(),
     ));
@@ -289,7 +290,7 @@ async fn verify_map(
     body: bytes::Bytes,
     server2: &ServerArc,
 ) -> Result<impl warp::Reply, Infallible> {
-    let server = server2.read().await;
+    let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
         return Ok(warp::reply::Response::new(
@@ -311,7 +312,7 @@ async fn verify_json_map(
     body: Vec<u8>,
     server2: &ServerArc,
 ) -> Result<impl warp::Reply, Infallible> {
-    let server = server2.read().await;
+    let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
         return Ok(warp::reply::json(&"BAD_REQUEST"));

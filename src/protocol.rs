@@ -192,13 +192,20 @@ impl CK {
     }
 }
 
+
+#[derive(Clone, Debug)]
+pub struct Session {
+    pub token: String,
+}
+
 #[derive(Clone)]
-pub struct Server<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> {
+pub struct Server<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SessionsT> {
     users: E,
     rng: StdRng,
     challenges: D,
     secrets: T,
     passes: U,
+    sessions: F,
 }
 
 pub struct Secrets(HashMap<Uuid, [u8; 32]>);
@@ -206,6 +213,8 @@ pub struct Secrets(HashMap<Uuid, [u8; 32]>);
 pub struct Passes(HashMap<(Uuid, Uuid), Vec<u8>>);
 
 pub struct Challenges(HashMap<Uuid, [u8; 32]>);
+
+pub struct Sessions(HashMap<Uuid, Session>);
 
 pub struct Users(HashMap<Uuid, CK>);
 
@@ -238,14 +247,22 @@ impl UsersT for Users {
     }
 }
 
+pub trait SessionsT {
+    fn get_session(&self, id: Uuid) -> ResultP<Session>;
+    fn add_session(&mut self, id: Uuid, session: Session);
+    fn remove_session(&mut self, id: Uuid) -> ResultP<()>;
+}
+
 pub trait SecretsT {
     fn get_secret(&self, id: Uuid) -> ResultP<[u8; 32]>;
     fn add_secret(&mut self, id: Uuid, secret: [u8; KYBER_SSBYTES]);
+    fn remove_secret(&mut self, id: Uuid) -> ResultP<()>;
 }
 
 pub trait ChallengesT {
     fn get_challenge(&self, id: Uuid) -> ResultP<[u8; 32]>;
     fn add_challenge(&mut self, id: Uuid, challenge: [u8; 32]);
+    fn remove_challenge(&mut self, id: Uuid) -> ResultP<()>;
 }
 
 impl ChallengesT for Challenges {
@@ -255,6 +272,13 @@ impl ChallengesT for Challenges {
 
     fn add_challenge(&mut self, id: Uuid, challenge: [u8; 32]) {
         self.0.insert(id, challenge);
+    }
+
+    fn remove_challenge(&mut self, id: Uuid) -> ResultP<()> {
+        self.0
+            .remove(&id)
+            .ok_or(ProtocolError::StorageError)
+            .map(|_| ())
     }
 }
 
@@ -303,6 +327,26 @@ impl PassesT for Passes {
     }
 }
 
+impl SessionsT for Sessions {
+    fn get_session(&self, id: Uuid) -> ResultP<Session> {
+        self.0
+            .get(&id)
+            .cloned()
+            .ok_or(ProtocolError::StorageError)
+    }
+
+    fn add_session(&mut self, id: Uuid, session: Session) {
+        self.0.insert(id, session);
+    }
+
+    fn remove_session(&mut self, id: Uuid) -> ResultP<()> {
+        self.0
+            .remove(&id)
+            .ok_or(ProtocolError::StorageError)
+            .map(|_| ())
+    }
+}
+
 impl SecretsT for Secrets {
     fn get_secret(&self, id: Uuid) -> ResultP<[u8; 32]> {
         self.0.get(&id).cloned().ok_or(ProtocolError::StorageError)
@@ -311,9 +355,16 @@ impl SecretsT for Secrets {
     fn add_secret(&mut self, id: Uuid, secret: [u8; 32]) {
         self.0.insert(id, secret);
     }
+
+    fn remove_secret(&mut self, id: Uuid) -> ResultP<()> {
+        self.0
+            .remove(&id)
+            .ok_or(ProtocolError::StorageError)
+            .map(|_| ())
+    }
 }
 
-impl Server<Secrets, Passes, Challenges, Users> {
+impl Server<Secrets, Passes, Challenges, Users, Sessions> {
     pub fn new() -> ResultP<Self> {
         let rng = SeedableRng::from_entropy();
         Ok(Server {
@@ -322,11 +373,12 @@ impl Server<Secrets, Passes, Challenges, Users> {
             challenges: Challenges(HashMap::new()),
             secrets: Secrets(HashMap::new()),
             passes: Passes(HashMap::new()),
+            sessions: Sessions(HashMap::new()),
         })
     }
 }
 #[cfg(feature = "server")]
-impl Server<Secrets, PassesPostgres, Challenges, UsersPostgres> {
+impl Server<Secrets, PassesPostgres, Challenges, UsersPostgres, Sessions> {
     pub async fn new(postgres_url: &str, file: &str) -> ResultP<Self> {
         let rng = SeedableRng::from_entropy();
         let passes = PassesPostgres::new(postgres_url, file)
@@ -341,11 +393,12 @@ impl Server<Secrets, PassesPostgres, Challenges, UsersPostgres> {
             challenges: Challenges(HashMap::new()),
             secrets: Secrets(HashMap::new()),
             passes,
+            sessions: Sessions(HashMap::new()),
         })
     }
 }
 
-impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
+impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SessionsT> Server<T, U, D, E, F> {
     pub async fn add_user(&mut self, ck: &mut CK) -> ResultP<Uuid> {
         ck.set_id();
         let id = ck.id.unwrap();
@@ -365,7 +418,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
         Ok(challenge)
     }
 
-    pub async fn verify(&self, id: Uuid, signature: &[u8]) -> ResultP<()> {
+    pub async fn verify(&mut self, id: Uuid, signature: &[u8]) -> ResultP<()> {
         if signature.len() != di::SIGNBYTES {
             return Err(ProtocolError::AuthError);
         }
@@ -373,6 +426,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
         let challenge = self.challenges.get_challenge(id)?;
         let verify = ck.di_p.to_di().verify(&challenge, &signature);
         if verify {
+            self.challenges.remove_challenge(id)?;
             Ok(())
         } else {
             Err(ProtocolError::AuthError)
