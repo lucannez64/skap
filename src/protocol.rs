@@ -12,7 +12,6 @@ use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     Key, XChaCha20Poly1305, XNonce,
 };
-use crystals_dilithium::dilithium5 as di;
 use libcrux_ml_kem::mlkem1024::{
     self, MlKem1024Ciphertext, MlKem1024PrivateKey, MlKem1024PublicKey,
 };
@@ -26,6 +25,8 @@ use std::fmt;
 use std::io::Write;
 use std::{collections::HashMap, io::Read};
 use uuid::Uuid;
+use fips204::ml_dsa_87;
+use fips204::traits::{SerDes, Signer, Verifier};
 
 const KYBER_PUBLICKEYBYTES: usize = 1568;
 const KYBER_CIPHERTEXTBYTES: usize = 1568;
@@ -105,14 +106,14 @@ impl ToSql for KyPublicKey {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct DiPublicKey {
     #[serde_as(as = "Bytes")]
-    pub bytes: [u8; 2592],
+    pub bytes: [u8; ml_dsa_87::PK_LEN],
 }
 
 #[serde_as]
 #[derive(Clone, Serialize, Deserialize, Debug, Copy)]
 pub struct DiSecretKey {
     #[serde_as(as = "Bytes")]
-    pub bytes: [u8; di::SECRETKEYBYTES],
+    pub bytes: [u8; ml_dsa_87::SK_LEN],
 }
 
 #[cfg(feature = "server")]
@@ -146,22 +147,22 @@ impl ToSql for DiPublicKey {
 }
 
 impl DiPublicKey {
-    fn from_di(pb: di::PublicKey) -> Self {
-        DiPublicKey { bytes: pb.bytes }
+    fn from_di(pb: ml_dsa_87::PublicKey) -> Self {
+        DiPublicKey { bytes: pb.into_bytes() }
     }
 
-    fn to_di(self) -> di::PublicKey {
-        di::PublicKey::from_bytes(&self.bytes)
+    fn to_di(self) -> ml_dsa_87::PublicKey {
+        ml_dsa_87::PublicKey::try_from_bytes(&self.bytes).unwrap()
     }
 }
 
 impl DiSecretKey {
-    fn from_di(pb: di::SecretKey) -> Self {
-        DiSecretKey { bytes: pb.bytes }
+    fn from_di(pb: ml_dsa_87::PrivateKey) -> Self {
+        DiSecretKey { bytes: pb.into_bytes() }
     }
 
-    fn to_di(self) -> di::SecretKey {
-        di::SecretKey::from_bytes(&self.bytes)
+    pub fn to_di(self) -> ml_dsa_87::PrivateKey {
+        ml_dsa_87::PrivateKey::try_from_bytes(&self.bytes).unwrap()
     }
 }
 
@@ -366,12 +367,12 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
     }
 
     pub async fn verify(&self, id: Uuid, signature: &[u8]) -> ResultP<()> {
-        if signature.len() != di::SIGNBYTES {
+        if signature.len() !=  ml_dsa_87::SIG_LEN {
             return Err(ProtocolError::AuthError);
         }
         let ck = self.get_user(id).await?;
         let challenge = self.challenges.get_challenge(id)?;
-        let verify = ck.di_p.to_di().verify(&challenge, &signature);
+        let verify = ck.di_p.to_di().verify(&challenge, &signature, &[]);
         if verify {
             Ok(())
         } else {
@@ -564,9 +565,9 @@ impl Client {
         let keypair = mlkem1024::generate_key_pair(randomness);
         let ky_p = *keypair.pk();
         let ky_q = *keypair.sk();
-        let dikeypair = di::Keypair::generate(None);
-        let di_p = dikeypair.public;
-        let di_q = dikeypair.secret;
+        let dikeypair = ml_dsa_87::try_keygen().map_err(|_| ProtocolError::CryptoError)?;
+        let di_p = dikeypair.0;
+        let di_q = dikeypair.1;
         Ok(Client {
             ky_p: KyPublicKey { bytes: ky_p },
             ky_q,
@@ -638,7 +639,7 @@ impl Client {
         Ok(pass)
     }
 
-    pub fn sign(&self, challenge: &[u8]) -> [u8; crystals_dilithium::dilithium5::SIGNBYTES] {
+    pub fn sign(&self, challenge: &[u8]) -> [u8; ml_dsa_87::SIG_LEN] {
         di::SecretKey::sign(&self.di_q.clone().to_di(), challenge)
     }
 
