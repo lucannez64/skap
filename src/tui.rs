@@ -17,12 +17,15 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Widget, Wrap},
     Frame, Terminal,
 };
+
+use reqwest_cookie_store::{CookieStore, CookieStoreRwLock};
 use ring::hmac;
 use serde::{Deserialize, Serialize};
 use std::{
     io,
     str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::Arc,
 };
 use uuid::Uuid;
 
@@ -228,7 +231,13 @@ async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> io::Result<()> {
-    let client = reqwest::Client::new();
+
+    let cookie_store = CookieStore::default();
+    let jar = Arc::new(CookieStoreRwLock::new(cookie_store));
+    let client = reqwest::Client::builder()
+        .cookie_provider(Arc::clone(&jar))
+        .build()
+        .unwrap();
 
     loop {
         terminal.draw(|f| ui(f, app))?;
@@ -237,7 +246,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             if event {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        handle_input(key.code, app, &client).await;
+                        handle_input(key.code, app, &client, Arc::clone(&jar)).await;
                     }
                 }
             }
@@ -249,17 +258,17 @@ async fn run_app<B: ratatui::backend::Backend>(
     }
 }
 
-async fn handle_input(key: KeyCode, app: &mut App, client: &reqwest::Client) {
+async fn handle_input(key: KeyCode, app: &mut App, client: &reqwest::Client, jar: Arc<CookieStoreRwLock>) {
     match app.current_screen {
-        CurrentScreen::Main => handle_main_screen(key, app, client).await,
-        CurrentScreen::AddingPassword => handle_add_screen(key, app, client).await,
-        CurrentScreen::ViewingPasswords => handle_view_screen(key, app, client).await,
-        CurrentScreen::EditingPassword => handle_edit_screen(key, app, client).await,
+        CurrentScreen::Main => handle_main_screen(key, app,client, Arc::clone(&jar)).await,
+        CurrentScreen::AddingPassword => handle_add_screen(key, app, client, Arc::clone(&jar)).await,
+        CurrentScreen::ViewingPasswords => handle_view_screen(key, app, client, Arc::clone(&jar)).await,
+        CurrentScreen::EditingPassword => handle_edit_screen(key, app, client, Arc::clone(&jar)).await,
         CurrentScreen::Exiting => {}
     }
 }
 
-async fn handle_main_screen(key: KeyCode, app: &mut App, client2: &reqwest::Client) {
+async fn handle_main_screen(key: KeyCode, app: &mut App, client2: &reqwest::Client, jar: Arc<CookieStoreRwLock>) {
     match key {
         KeyCode::Enter => {
             if !app.logged_in {
@@ -275,6 +284,7 @@ async fn handle_main_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
                                 client.1.id.unwrap(),
                                 &mut client.0,
                                 password.clone(),
+                                Arc::clone(&jar),
                             )
                             .await
                             {
@@ -292,7 +302,7 @@ async fn handle_main_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
             if app.entered_log {
                 app.log_or_create = true;
                 app.entered_log = false;
-                match try_login(client2, &app.email_input).await {
+                match try_login(client2, &app.email_input, Arc::clone(&jar)).await {
                     Ok((client, ck)) => {
                         app.client = Some((client, ck));
                         app.logged_in = true;
@@ -308,7 +318,7 @@ async fn handle_main_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
             if app.entered_log {
                 app.log_or_create = false;
                 app.entered_log = false;
-                match try_create(client2, &app.email_input).await {
+                match try_create(client2, &app.email_input, Arc::clone(&jar)).await {
                     Ok((client, ck)) => {
                         let a = ClientEx::new(&client, &ck);
                         let w = a.to_file("client".to_string());
@@ -338,7 +348,7 @@ async fn handle_main_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
             if app.logged_in {
                 if let Some(client) = &mut app.client {
                     if let Ok(passwords) =
-                        client::get_all(client2, client.1.id.unwrap(), &mut client.0).await
+                        client::get_all(client2, client.1.id.unwrap(), &mut client.0, Arc::clone(&jar)).await
                     {
                         app.password_list.items = passwords;
                         app.current_screen = CurrentScreen::ViewingPasswords;
@@ -360,12 +370,13 @@ async fn handle_main_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
 async fn try_create(
     client2: &reqwest::Client,
     email: &str,
+    jar: Arc<CookieStoreRwLock>,
 ) -> Result<(crate::protocol::Client, protocol::CK), protocol::ProtocolError> {
     let (mut client, ck) = client::new(client2, email)
         .await
         .map_err(|_| protocol::ProtocolError::AuthError)?;
     let uuid = ck.id.unwrap();
-    client::auth(client2, uuid, &mut client)
+    client::auth(client2,  Arc::clone(&jar), uuid, &mut client)
         .await
         .map_err(|_| protocol::ProtocolError::AuthError)?;
     Ok((client, ck))
@@ -374,11 +385,12 @@ async fn try_create(
 async fn try_login(
     client2: &reqwest::Client,
     email: &str,
+    jar: Arc<CookieStoreRwLock>,
 ) -> Result<(crate::protocol::Client, protocol::CK), protocol::ProtocolError> {
     if let Ok(c) = ClientEx::from_file(email.to_string()) {
         let (mut client, ck) = (c.c, c.id);
         let uuid = ck.id.unwrap();
-        client::auth(client2, uuid, &mut client)
+        client::auth(client2,  Arc::clone(&jar),uuid, &mut client)
             .await
             .map_err(|_| protocol::ProtocolError::AuthError)?;
         Ok((client, ck))
@@ -387,7 +399,7 @@ async fn try_login(
     }
 }
 
-async fn handle_add_screen(key: KeyCode, app: &mut App, client2: &reqwest::Client) {
+async fn handle_add_screen(key: KeyCode, app: &mut App, client2: &reqwest::Client, jar: Arc<CookieStoreRwLock>) {
     match key {
         KeyCode::Char(c) => match app.current_field {
             0 => app.new_password.username.push(c),
@@ -418,6 +430,7 @@ async fn handle_add_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clien
                     client.1.id.unwrap(),
                     &mut client.0,
                     app.new_password.clone(),
+                    Arc::clone(&jar),
                 )
                 .await
                 {
@@ -441,7 +454,7 @@ async fn handle_add_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clien
     }
 }
 
-async fn handle_view_screen(key: KeyCode, app: &mut App, client2: &reqwest::Client) {
+async fn handle_view_screen(key: KeyCode, app: &mut App, client2: &reqwest::Client, jar: Arc<CookieStoreRwLock>) {
     match key {
         KeyCode::Char('q') => {
             if app.searching {
@@ -474,7 +487,7 @@ async fn handle_view_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
             } else if let Some(selected) = app.password_list.state.selected() {
                 let (_, uuid) = &app.password_list.items[selected];
                 if let Some(client) = &mut app.client {
-                    if client::delete_pass(client2, client.1.id.unwrap(), *uuid)
+                    if client::delete_pass(client2, client.1.id.unwrap(), *uuid, Arc::clone(&jar))
                         .await
                         .is_ok()
                     {
@@ -553,7 +566,7 @@ async fn handle_view_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
     }
 }
 
-async fn handle_edit_screen(key: KeyCode, app: &mut App, client2: &reqwest::Client) {
+async fn handle_edit_screen(key: KeyCode, app: &mut App, client2: &reqwest::Client, jar: Arc<CookieStoreRwLock>) {
     match key {
         KeyCode::Char(c) => match app.current_field {
             0 => app.edit_password.username.push(c),
@@ -587,6 +600,7 @@ async fn handle_edit_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
                         uuid,
                         &mut client.0,
                         app.edit_password.clone(),
+                        Arc::clone(&jar),
                     )
                     .await
                     .is_ok()

@@ -5,11 +5,18 @@ use crate::protocol::Secrets;
 use crate::protocol::Server as Server2;
 use crate::protocol::CK;
 use crate::protocol::EP;
+use serde::Deserialize;
 use serde::Serialize;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use warp::Filter;
+use warp::{Filter, reject, Rejection, Reply, reply::Response};
+use pasetors::claims::{Claims, ClaimsValidationRules};
+use pasetors::keys::{SymmetricKey, Generate};
+use pasetors::{local, Local, version4::V4};
+use pasetors::token::UntrustedToken;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use core::convert::TryInto;
 
 #[derive(Serialize)]
 struct ErrorMessage {
@@ -19,6 +26,43 @@ struct ErrorMessage {
 
 pub type ServerArc = Arc<RwLock<Server2<Secrets, PassesPostgres, Challenges, UsersPostgres>>>;
 
+
+async fn auth_validation(sk: Arc<RwLock<SymmetricKey<V4>>>, uuid: &str, token: String) -> (bool,Result<Response, Infallible>) {
+    let sk = sk.read().await;
+    let validation = ClaimsValidationRules::new();
+    let untrusted_token = UntrustedToken::<Local, V4>::try_from(&token);
+    if untrusted_token.is_err() {
+        return (false,auth_error());
+    }
+    let untrusted_token = untrusted_token.unwrap();
+
+    match local::decrypt(&sk, &untrusted_token, &validation, None, Some(b"skap")) {
+        Ok(trusted_token) => {
+            let claims = trusted_token.payload_claims();
+            if claims.is_none() {
+                return (false,auth_error());
+            }
+            let claims = claims.unwrap();
+            if claims.get_claim("sub").is_none() {
+                return (false,auth_error());
+            }
+            
+            if uuid.replace("-", "").replace("\"", "") == claims.get_claim("sub").unwrap().as_str().unwrap().replace("-", "").replace("\"", ""){
+                (true,Ok(warp::reply::with_status(warp::reply(), warp::http::StatusCode::OK).into_response()))
+            } else {
+                (false,auth_error())
+            }
+        }
+        Err(_) => {
+            return (false,auth_error());
+        }
+    }
+}
+
+fn auth_error() -> Result< Response,Infallible> {
+    Ok(warp::reply::with_status(warp::reply(), warp::http::StatusCode::UNAUTHORIZED).into_response())
+}
+
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let ca = std::env::var("CA_FILE").expect("CA must be set");
@@ -27,9 +71,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .unwrap(),
     ));
+    let mut sk: SymmetricKey<V4>;
+    if std::env::var("BASE64_KEY").is_err() {
+        sk = SymmetricKey::<V4>::generate().unwrap();
+        println!("BASE64_KEY not set, generating new key");
+        println!("BASE64_KEY: {}", base64::engine::general_purpose::STANDARD.encode(sk.as_bytes()));
+    } else {
+        let base64k = std::env::var("BASE64_KEY").expect("BASE64_KEY must be set");
+        let skbytes = STANDARD.decode(&base64k).unwrap();
+        sk = SymmetricKey::<V4>::from(&skbytes).unwrap();
+    }
 
+    let mutexsk = Arc::new(RwLock::new(sk));
     let server_filter = warp::any().map(move || Arc::clone(&server2));
-
+    let mutexsk_filter = warp::any().map(move || Arc::clone(&mutexsk));
+    let cookies_filter = warp::filters::cookie::cookie("token");
     let create_user_json = warp::post()
         .and(warp::path("create_user_json"))
         .and(warp::body::json())
@@ -42,15 +98,29 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path("send_all"))
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
         .and_then(
-            |uui: String, server2: ServerArc| async move { send_all_map(uui, &server2).await },
+            |uui: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: String| async move { 
+                let (auth, reply) = auth_validation(sk, &uui, token).await;
+                if !auth {
+                    return reply;
+                }
+                send_all_map(uui, &server2).await 
+            },
         );
 
     let send_all_json = warp::get()
         .and(warp::path("send_all_json"))
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
-        .and_then(|uui: String, server2: ServerArc| async move {
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and_then(|uui: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: String| async move {
+            let (auth, reply) = auth_validation(sk, &uui, token).await;
+            if !auth {
+                return reply;
+            }
             send_all_json_map(uui, &server2).await
         });
 
@@ -66,23 +136,45 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path("sync_json"))
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
         .and_then(
-            |uui: String, server2: ServerArc| async move { sync_json_map(uui, &server2).await },
+            |uui: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: String| async move { 
+                let (auth, reply) = auth_validation(sk, &uui, token).await;
+                if !auth {
+                    return reply;
+                }
+                sync_json_map(uui, &server2).await 
+            },
         );
 
     let sync = warp::get()
         .and(warp::path("sync"))
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
-        .and_then(|uui: String, server2: ServerArc| async move { sync_map(uui, &server2).await });
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and_then(|uui: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: String| async move { 
+            let (auth, reply) = auth_validation(sk, &uui, token).await;
+            if !auth {
+                return reply;
+            }
+            sync_map(uui, &server2).await 
+        });
 
     let create_pass = warp::post()
         .and(warp::path("create_pass"))
         .and(warp::path::param::<String>())
         .and(warp::body::bytes())
         .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
         .and_then(
-            |uui: String, pass: bytes::Bytes, server2: ServerArc| async move {
+            |uui: String, pass: bytes::Bytes, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: String| async move {
+                let (auth, reply) = auth_validation(sk, &uui, token).await;
+                if !auth {
+                    return reply;
+                }
                 create_pass_map(uui, pass, &server2).await
             },
         );
@@ -92,7 +184,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(warp::body::json())
         .and(server_filter.clone())
-        .and_then(|uui: String, pass: EP, server2: ServerArc| async move {
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and_then(|uui: String, pass: EP, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: String| async move {
+            let (auth, reply) = auth_validation(sk, &uui, token).await;
+            if !auth {
+                return reply;
+            }
             create_pass_json_map(uui, pass, &server2).await
         });
 
@@ -117,9 +215,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(warp::body::bytes())
         .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
         .and_then(
-            |uui: String, body: bytes::Bytes, server2: ServerArc| async move {
-                verify_map(uui, body, &server2).await
+            |uui: String, body: bytes::Bytes, server2: ServerArc, mutexsk: Arc<RwLock<SymmetricKey<V4>>>| async move {
+                verify_map(uui, body, &server2, &mutexsk).await
             },
         );
 
@@ -128,9 +227,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(warp::body::json())
         .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
         .and_then(
-            |uui: String, body: Vec<u8>, server2: ServerArc| async move {
-                verify_json_map(uui, body, &server2).await
+            |uui: String, body: Vec<u8>, server2: ServerArc, mutexsk: Arc<RwLock<SymmetricKey<V4>>>| async move {
+                verify_json_map(uui, body, &server2, &mutexsk).await
             },
         );
 
@@ -140,8 +240,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(warp::body::bytes())
         .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
         .and_then(
-            |uui: String, uui2: String, pass: bytes::Bytes, server2: ServerArc| async move {
+            |uui: String, uui2: String, pass: bytes::Bytes, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: String| async move {
+                let (auth, reply) = auth_validation(sk, &uui, token).await;
+                if !auth {
+                    return reply;
+                }
                 update_pass_map(uui, uui2, pass, &server2).await
             },
         );
@@ -152,8 +258,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(warp::body::json())
         .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
         .and_then(
-            |uui: String, uui2: String, pass: EP, server2: ServerArc| async move {
+            |uui: String, uui2: String, pass: EP, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: String| async move {
+                let (auth, reply) = auth_validation(sk, &uui, token).await;
+                if !auth {
+                    return reply;
+                }
                 update_pass_json_map(uui, uui2, pass, &server2).await
             },
         );
@@ -163,7 +275,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
-        .and_then(|uui: String, uui2: String, server2: ServerArc| async move {
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and_then(|uui: String, uui2: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: String| async move {
+            let (auth, reply) = auth_validation(sk, &uui, token).await;
+            if !auth {
+                return reply;
+            }
             delete_map(uui, uui2, &server2).await
         });
 
@@ -172,7 +290,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
-        .and_then(|uui: String, uui2: String, server2: ServerArc| async move {
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and_then(|uui: String, uui2: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: String| async move {
+            let (auth, reply) = auth_validation(sk, &uui, token).await;
+            if !auth {
+                return reply;
+            }
             delete_json_map(uui, uui2, &server2).await
         });
 
@@ -181,7 +305,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
-        .and_then(|uui: String, uui2: String, server2: ServerArc| async move {
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and_then(|uui: String, uui2: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: String| async move {
+            let (auth, reply) = auth_validation(sk, &uui, token).await;
+            if !auth {
+                return reply;
+            }
             send_map(uui, uui2, &server2).await
         });
 
@@ -190,7 +320,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
-        .and_then(|uui: String, uui2: String, server2: ServerArc| async move {
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and_then(|uui: String, uui2: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: String| async move {
+            let (auth, reply) = auth_validation(sk, &uui, token).await;
+            if !auth {
+                return reply;
+            }
             send_json_map(uui, uui2, &server2).await
         });
 
@@ -220,7 +356,7 @@ async fn delete_map(
     uui: String,
     uui2: String,
     server2: &ServerArc,
-) -> Result<impl warp::Reply, Infallible> {
+) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui).unwrap();
     let uui2 = uuid::Uuid::parse_str(&uui2).unwrap();
@@ -238,49 +374,49 @@ async fn delete_json_map(
     uui: String,
     uui2: String,
     server2: &ServerArc,
-) -> Result<impl warp::Reply, Infallible> {
+) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui);
     let uui2 = uuid::Uuid::parse_str(&uui2);
     if id.is_err() || uui2.is_err() {
-        return Ok(warp::reply::json(&"BAD_REQUEST"));
+        return Ok(warp::reply::json(&"BAD_REQUEST").into_response());
     }
     match server.delete_pass(id.unwrap(), uui2.unwrap()).await {
-        Ok(()) => Ok(warp::reply::json(&"OK")),
-        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR")),
+        Ok(()) => Ok(warp::reply::json(&"OK").into_response()),
+        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR").into_response()),
     }
 }
 
-async fn challenge_map(uui: String, server2: &ServerArc) -> Result<impl warp::Reply, Infallible> {
+async fn challenge_map(uui: String, server2: &ServerArc) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
         return Ok(warp::reply::Response::new(
             bincode::serialize(&"BAD_REQUEST").unwrap().into(),
-        ));
+        ).into_response());
     }
     match server.challenge(id.unwrap()).await {
         Ok(challenge) => Ok(warp::reply::Response::new(
             bincode::serialize(&challenge).unwrap().into(),
-        )),
+        ).into_response()),
         Err(_) => Ok(warp::reply::Response::new(
             bincode::serialize(&"INTERNAL_SERVER_ERROR").unwrap().into(),
-        )),
+        ).into_response()),
     }
 }
 
 async fn challenge_json_map(
     uui: String,
     server2: &ServerArc,
-) -> Result<impl warp::Reply, Infallible> {
+) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
-        return Ok(warp::reply::json(&"BAD_REQUEST"));
+        return Ok(warp::reply::json(&"BAD_REQUEST").into_response());
     }
     match server.challenge(id.unwrap()).await {
-        Ok(challenge) => Ok(warp::reply::json(&challenge)),
-        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR")),
+        Ok(challenge) => Ok(warp::reply::json(&challenge).into_response()),
+        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR").into_response()),
     }
 }
 
@@ -288,21 +424,35 @@ async fn verify_map(
     uui: String,
     body: bytes::Bytes,
     server2: &ServerArc,
-) -> Result<impl warp::Reply, Infallible> {
+    mutexsk: &Arc<RwLock<SymmetricKey<V4>>>,
+) -> Result<Response, Infallible> {
     let server = server2.read().await;
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
         return Ok(warp::reply::Response::new(
             bincode::serialize(&"BAD_REQUEST").unwrap().into(),
-        ));
+        ).into_response());
     }
-    match server.verify(id.unwrap(), &body).await {
-        Ok(r) => Ok(warp::reply::Response::new(
-            bincode::serialize(&r).unwrap().into(),
-        )),
+    let body = bincode::deserialize::<Vec<u8>>(&body).unwrap();
+    match server.verify(id.clone().unwrap(), &body).await {
+        Ok(_) => {
+            let sk = mutexsk.read().await;
+            let mut claims = Claims::new().unwrap();
+            claims.subject(&id.unwrap().to_string()).unwrap();
+            let token = local::encrypt(&sk, &claims, None, Some(b"skap")).unwrap();
+            Ok(
+                warp::reply::with_header(
+                    token.clone(),
+                    "set-cookie",
+                    format!(
+                        "token={}; Path=/; HttpOnly; Max-Age=3600; SameSite=Strict", token
+                    ),
+                ).into_response()
+            )
+        },
         Err(_) => Ok(warp::reply::Response::new(
-            bincode::serialize(&"INTERNAL_SERVER_ERROR").unwrap().into(),
-        )),
+            bincode::serialize(&"AUTHENTICATION_FAILED").unwrap().into(),
+        ).into_response()),
     }
 }
 
@@ -310,15 +460,30 @@ async fn verify_json_map(
     uui: String,
     body: Vec<u8>,
     server2: &ServerArc,
-) -> Result<impl warp::Reply, Infallible> {
+    mutexsk: &Arc<RwLock<SymmetricKey<V4>>>,
+) -> Result<Response, Infallible> {
     let server = server2.read().await;
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
-        return Ok(warp::reply::json(&"BAD_REQUEST"));
+        return Ok(warp::reply::json(&"BAD_REQUEST").into_response());
     }
-    match server.verify(id.unwrap(), body.as_slice()).await {
-        Ok(r) => Ok(warp::reply::json(&r)),
-        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR")),
+    match server.verify(id.clone().unwrap(), body.as_slice()).await {
+        Ok(r) => {
+            let sk = mutexsk.read().await;
+            let mut claims = Claims::new().unwrap();
+            claims.subject(&id.unwrap().to_string()).unwrap();
+            let token = local::encrypt(&sk, &claims, None, Some(b"skap")).unwrap();
+            Ok(
+                warp::reply::with_header(
+                    token.clone(),
+                    "set-cookie",
+                    format!(
+                        "token={}; Path=/; HttpOnly; Max-Age=3600; SameSite=Strict", token
+                    ),
+                ).into_response()
+            )
+        },
+        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR").into_response()),
     }
 }
 
@@ -327,7 +492,7 @@ async fn update_pass_map(
     uui2: String,
     pass: bytes::Bytes,
     server2: &ServerArc,
-) -> Result<impl warp::Reply, Infallible> {
+) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui);
     let id2 = uuid::Uuid::parse_str(&uui2);
@@ -335,16 +500,16 @@ async fn update_pass_map(
     if id.is_err() || id2.is_err() || ep.is_err() {
         return Ok(warp::reply::Response::new(
             bincode::serialize(&"BAD_REQUEST").unwrap().into(),
-        ));
+        ).into_response());
     }
     let id2 = id2.unwrap();
     match server.update_pass(id.unwrap(), id2, ep.unwrap()).await {
         Ok(()) => Ok(warp::reply::Response::new(
             bincode::serialize(&id2).unwrap().into(),
-        )),
+        ).into_response()),
         Err(_) => Ok(warp::reply::Response::new(
             bincode::serialize(&"INTERNAL_SERVER_ERROR").unwrap().into(),
-        )),
+        ).into_response()),
     }
 }
 
@@ -353,20 +518,20 @@ async fn update_pass_json_map(
     uui2: String,
     pass: EP,
     server2: &ServerArc,
-) -> Result<impl warp::Reply, Infallible> {
+) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
-        return Ok(warp::reply::json(&"BAD_REQUEST"));
+        return Ok(warp::reply::json(&"BAD_REQUEST").into_response());
     }
     let id2 = uuid::Uuid::parse_str(&uui2);
     if id2.is_err() {
-        return Ok(warp::reply::json(&"BAD_REQUEST"));
+        return Ok(warp::reply::json(&"BAD_REQUEST").into_response());
     }
     let id2 = id2.unwrap();
     match server.update_pass(id.unwrap(), id2, pass).await {
-        Ok(()) => Ok(warp::reply::json(&id2)),
-        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR")),
+        Ok(()) => Ok(warp::reply::json(&id2).into_response()),
+        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR").into_response()),
     }
 }
 
@@ -374,22 +539,22 @@ async fn send_map(
     uui: String,
     uui2: String,
     server2: &ServerArc,
-) -> Result<impl warp::Reply, Infallible> {
+) -> Result<Response, Infallible> {
     let server = server2.read().await;
     let id = uuid::Uuid::parse_str(&uui);
     let id2 = uuid::Uuid::parse_str(&uui2);
     if id.is_err() || id2.is_err() {
         return Ok(warp::reply::Response::new(
             bincode::serialize(&"BAD_REQUEST").unwrap().into(),
-        ));
+        ).into_response());
     }
     match server.send(id.unwrap(), id2.unwrap()).await {
         Ok(r) => Ok(warp::reply::Response::new(
             bincode::serialize(&r).unwrap().into(),
-        )),
+        ).into_response()),
         Err(_) => Ok(warp::reply::Response::new(
             bincode::serialize(&"INTERNAL_SERVER_ERROR").unwrap().into(),
-        )),
+        ).into_response()),
     }
 }
 
@@ -397,16 +562,16 @@ async fn send_json_map(
     uui: String,
     uui2: String,
     server2: &ServerArc,
-) -> Result<impl warp::Reply, Infallible> {
+) -> Result<Response, Infallible> {
     let server = server2.read().await;
     let id = uuid::Uuid::parse_str(&uui);
     let id2 = uuid::Uuid::parse_str(&uui2);
     if id.is_err() || id2.is_err() {
-        return Ok(warp::reply::json(&"BAD_REQUEST"));
+        return Ok(warp::reply::json(&"BAD_REQUEST").into_response());
     }
     match server.send(id.unwrap(), id2.unwrap()).await {
-        Ok(r) => Ok(warp::reply::json(&r)),
-        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR")),
+        Ok(r) => Ok(warp::reply::json(&r).into_response()),
+        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR").into_response()),
     }
 }
 
@@ -414,22 +579,22 @@ async fn create_pass_map(
     uui: String,
     pass: bytes::Bytes,
     server2: &ServerArc,
-) -> Result<impl warp::Reply, Infallible> {
+) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui);
     let ep = bincode::deserialize::<EP>(&pass);
     if id.is_err() || ep.is_err() {
         return Ok(warp::reply::Response::new(
             bincode::serialize(&"BAD_REQUEST").unwrap().into(),
-        ));
+        ).into_response());
     }
     match server.create_pass(id.unwrap(), ep.unwrap()).await {
         Ok(id2) => Ok(warp::reply::Response::new(
             bincode::serialize(&id2).unwrap().into(),
-        )),
+        ).into_response()),
         Err(_) => Ok(warp::reply::Response::new(
             bincode::serialize(&"INTERNAL_SERVER_ERROR").unwrap().into(),
-        )),
+        ).into_response()),
     }
 }
 
@@ -437,49 +602,49 @@ async fn create_pass_json_map(
     uui: String,
     pass: EP,
     server2: &ServerArc,
-) -> Result<impl warp::Reply, Infallible> {
+) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
-        return Ok(warp::reply::json(&"BAD_REQUEST"));
+        return Ok(warp::reply::json(&"BAD_REQUEST").into_response());
     }
     match server.create_pass(id.unwrap(), pass).await {
-        Ok(id2) => Ok(warp::reply::json(&id2)),
-        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR")),
+        Ok(id2) => Ok(warp::reply::json(&id2).into_response()),
+        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR").into_response()),
     }
 }
 
-async fn sync_map(uui: String, server2: &ServerArc) -> Result<impl warp::Reply, Infallible> {
+async fn sync_map(uui: String, server2: &ServerArc) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
         return Ok(warp::reply::Response::new(
             bincode::serialize(&"BAD_REQUEST").unwrap().into(),
-        ));
+        ).into_response());
     }
     match server.sync(id.unwrap()).await {
-        Ok(ciphertextsync) => Ok(warp::reply::Response::new(ciphertextsync.to_vec().into())),
+        Ok(ciphertextsync) => Ok(warp::reply::Response::new(bincode::serialize(&ciphertextsync.to_vec()).unwrap().into())),
         Err(_) => Ok(warp::reply::Response::new(
             bincode::serialize(&"INTERNAL_SERVER_ERROR").unwrap().into(),
-        )),
+        ).into_response()),
     }
 }
 
-async fn sync_json_map(uui: String, server2: &ServerArc) -> Result<impl warp::Reply, Infallible> {
+async fn sync_json_map(uui: String, server2: &ServerArc) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
-        return Ok(warp::reply::json(&"BAD_REQUEST"));
+        return Ok(warp::reply::json(&"BAD_REQUEST").into_response());
     }
     match server.sync(id.unwrap()).await {
-        Ok(ciphertextsync) => Ok(warp::reply::json(&ciphertextsync.to_vec())),
-        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR")),
+        Ok(ciphertextsync) => Ok(warp::reply::json(&ciphertextsync.to_vec()).into_response()),
+        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR").into_response()),
     }
 }
 async fn create_user_map(
     body: bytes::Bytes,
     server2: &ServerArc,
-) -> Result<impl warp::Reply, Infallible> {
+) -> Result<Response, Infallible> {
     match bincode::deserialize::<CK>(&body) {
         Ok(mut ck) => {
             let mut server = server2.write().await;
@@ -488,62 +653,62 @@ async fn create_user_map(
                     println!("User created with uuid {} && name {}", uuid, ck.email);
                     Ok(warp::reply::Response::new(
                         bincode::serialize(&ck).unwrap().into(),
-                    ))
+                    ).into_response())
                 }
                 Err(_) => Ok(warp::reply::Response::new(
                     bincode::serialize(&"INTERNAL_SERVER_ERROR").unwrap().into(),
-                )),
+                ).into_response()),
             }
         }
         Err(_) => Ok(warp::reply::Response::new(
             bincode::serialize(&"DESERIALIZATION_ERROR").unwrap().into(),
-        )),
+        ).into_response()),
     }
 }
 
 async fn create_user_json_map(
     mut ck: CK,
     server2: &ServerArc,
-) -> Result<impl warp::Reply, Infallible> {
+) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     match server.add_user(&mut ck).await {
         Ok(uuid) => {
             println!("User created with uuid {} && name {}", uuid, ck.email);
-            Ok(warp::reply::json(&ck))
+            Ok(warp::reply::json(&ck).into_response())
         }
-        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR")),
+        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR").into_response()),
     }
 }
 
-async fn send_all_map(uui: String, server2: &ServerArc) -> Result<impl warp::Reply, Infallible> {
+async fn send_all_map(uui: String, server2: &ServerArc) -> Result<Response, Infallible> {
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
         return Ok(warp::reply::Response::new(
             bincode::serialize(&"BAD_REQUEST").unwrap().into(),
-        ));
+        ).into_response());
     }
     let server = server2.read().await;
     match server.send_all(id.unwrap()).await {
         Ok(r) => Ok(warp::reply::Response::new(
             bincode::serialize(&r).unwrap().into(),
-        )),
+        ).into_response()),
         Err(_) => Ok(warp::reply::Response::new(
             bincode::serialize(&"INTERNAL_SERVER_ERROR").unwrap().into(),
-        )),
+        ).into_response()),
     }
 }
 
 async fn send_all_json_map(
     uui: String,
     server2: &ServerArc,
-) -> Result<impl warp::Reply, Infallible> {
+) -> Result<Response, Infallible> {
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
-        return Ok(warp::reply::json(&"BAD_REQUEST"));
+        return Ok(warp::reply::json(&"BAD_REQUEST").into_response());
     }
     let server = server2.read().await;
     match server.send_all(id.unwrap()).await {
-        Ok(r) => Ok(warp::reply::json(&r)),
-        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR")),
+        Ok(r) => Ok(warp::reply::json(&r).into_response()),
+        Err(_) => Ok(warp::reply::json(&"INTERNAL_SERVER_ERROR").into_response()),
     }
 }

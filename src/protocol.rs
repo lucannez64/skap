@@ -123,7 +123,8 @@ impl<'a> FromSql<'a> for DiPublicKey {
         raw: &[u8],
     ) -> Result<DiPublicKey, Box<dyn std::error::Error + Sync + Send>> {
         let bt = postgres_protocol::types::bytea_from_sql(&raw);
-        let t = DiPublicKey::from_di(di::PublicKey::from_bytes(&bt));
+        let tt: [u8; ml_dsa_87::PK_LEN] = bt.try_into().unwrap();
+        let t = DiPublicKey::from_di(ml_dsa_87::PublicKey::try_from_bytes(tt).unwrap());
         Ok(t)
     }
 
@@ -137,7 +138,7 @@ impl ToSql for DiPublicKey {
         _ty: &postgres_types::Type,
         out: &mut BytesMut,
     ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        let bt = self.clone().to_di().bytes;
+        let bt = self.clone().bytes;
         postgres_protocol::types::bytea_to_sql(&bt, out);
         Ok(postgres_types::IsNull::No)
     }
@@ -152,7 +153,7 @@ impl DiPublicKey {
     }
 
     fn to_di(self) -> ml_dsa_87::PublicKey {
-        ml_dsa_87::PublicKey::try_from_bytes(&self.bytes).unwrap()
+        ml_dsa_87::PublicKey::try_from_bytes(self.bytes).unwrap()
     }
 }
 
@@ -162,7 +163,7 @@ impl DiSecretKey {
     }
 
     pub fn to_di(self) -> ml_dsa_87::PrivateKey {
-        ml_dsa_87::PrivateKey::try_from_bytes(&self.bytes).unwrap()
+        ml_dsa_87::PrivateKey::try_from_bytes(self.bytes).unwrap()
     }
 }
 
@@ -367,12 +368,14 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
     }
 
     pub async fn verify(&self, id: Uuid, signature: &[u8]) -> ResultP<()> {
+
         if signature.len() !=  ml_dsa_87::SIG_LEN {
             return Err(ProtocolError::AuthError);
         }
         let ck = self.get_user(id).await?;
         let challenge = self.challenges.get_challenge(id)?;
-        let verify = ck.di_p.to_di().verify(&challenge, &signature, &[]);
+        let signature2 : [u8; ml_dsa_87::SIG_LEN] = signature.try_into().unwrap();
+        let verify = ck.di_p.to_di().verify(&challenge, &signature2, &[]);
         if verify {
             Ok(())
         } else {
@@ -640,7 +643,7 @@ impl Client {
     }
 
     pub fn sign(&self, challenge: &[u8]) -> [u8; ml_dsa_87::SIG_LEN] {
-        di::SecretKey::sign(&self.di_q.clone().to_di(), challenge)
+        self.di_q.clone().to_di().try_sign(challenge, &[]).unwrap()
     }
 
     pub fn sync(&mut self, ciphertextsync: &[u8]) -> ResultP<()> {
