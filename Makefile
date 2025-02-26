@@ -16,6 +16,9 @@ run-server: server
 run-tui: tui
 	./target/release/skap-tui
 
+only-run-tui:
+	./target/release/skap-tui
+
 clean:
 	cargo clean
 run:

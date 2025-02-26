@@ -1,4 +1,6 @@
 use crate::protocol::*;
+use reqwest::{cookie::Jar, header::{HeaderValue, COOKIE}, Url};
+use reqwest_cookie_store::RawCookie;
 use uuid::Uuid;
 
 const BASE_URL: &str = "http://127.0.0.1:3030/";
@@ -19,6 +21,7 @@ pub async fn new(client2: &reqwest::Client, email: &str) -> Result<(Client, CK),
 
 pub async fn auth(
     client2: &reqwest::Client,
+    jar: std::sync::Arc<reqwest_cookie_store::CookieStoreRwLock>,
     uuid: Uuid,
     client: &mut Client,
 ) -> Result<(), reqwest::Error> {
@@ -33,12 +36,18 @@ pub async fn auth(
         .body(bincode::serialize(sign.as_slice()).unwrap())
         .send()
         .await?;
-    let sync = client2
+    let c = jar.read().unwrap();
+    let cookie = 
+        format!("token={}", c.iter_any().collect::<Vec<_>>()[0].value().replace("\"", ""));
+    let syncr = client2
         .get(BASE_URL.to_string() + "sync/" + uuid.to_string().as_str() + "/")
-        .send()
+        .header(COOKIE,HeaderValue::from_str(cookie.as_str()).unwrap());
+        
+    let sync = syncr.send()
         .await?;
     let d = sync.bytes().await?;
-    client.sync(&d).unwrap();
+    let dd = bincode::deserialize::<&[u8]>(&d).unwrap();
+    client.sync(&dd).unwrap();
     Ok(())
 }
 
@@ -47,11 +56,16 @@ pub async fn create_pass(
     uuid: Uuid,
     client: &mut Client,
     pass: Password,
+    jar: std::sync::Arc<reqwest_cookie_store::CookieStoreRwLock>,
 ) -> Result<(Uuid), reqwest::Error> {
     let encrypted = client.encrypt(pass.clone()).unwrap();
     let eq = client.send(encrypted).unwrap();
+    let c = jar.read().unwrap();
+    let cookie = 
+        format!("token={}", c.iter_any().collect::<Vec<_>>()[0].value().replace("\"", ""));
     let res = client2
         .post(BASE_URL.to_string() + "create_pass/" + uuid.to_string().as_str() + "/")
+        .header(COOKIE,HeaderValue::from_str(cookie.as_str()).unwrap())
         .body(bincode::serialize(&eq).unwrap())
         .send()
         .await?;
@@ -64,9 +78,13 @@ pub async fn update_pass(
     uuid2: Uuid,
     client: &mut Client,
     pass: Password,
+    jar: std::sync::Arc<reqwest_cookie_store::CookieStoreRwLock>,
 ) -> Result<(Uuid), reqwest::Error> {
     let encrypted = client.encrypt(pass.clone()).unwrap();
     let eq = client.send(encrypted).unwrap();
+    let c = jar.read().unwrap();
+    let cookie = 
+        format!("token={}", c.iter_any().collect::<Vec<_>>()[0].value().replace("\"", ""));
     let res = client2
         .post(
             BASE_URL.to_string()
@@ -76,6 +94,7 @@ pub async fn update_pass(
                 + uuid2.to_string().as_str()
                 + "/",
         )
+        .header(COOKIE,HeaderValue::from_str(cookie.as_str()).unwrap())
         .body(bincode::serialize(&eq).unwrap())
         .send()
         .await?;
@@ -86,12 +105,18 @@ pub async fn get_all(
     client2: &reqwest::Client,
     uuid: Uuid,
     client: &mut Client,
+    jar: std::sync::Arc<reqwest_cookie_store::CookieStoreRwLock>,
 ) -> Result<Vec<(Password, Uuid)>, reqwest::Error> {
+    let c = jar.read().unwrap();
+    let cookie = 
+        format!("token={}", c.iter_any().collect::<Vec<_>>()[0].value().replace("\"", ""));
     let res = client2
         .get(BASE_URL.to_string() + "send_all/" + uuid.to_string().as_str() + "/")
+        .header(COOKIE,HeaderValue::from_str(cookie.as_str()).unwrap())
         .send()
         .await?;
     let d = res.bytes().await?;
+
     let mut passwords: Vec<(Password, Uuid)> = Vec::new();
     let da = bincode::deserialize::<Vec<(EP, Uuid)>>(&d).unwrap();
     for g in da.iter() {
@@ -101,7 +126,10 @@ pub async fn get_all(
     Ok(passwords)
 }
 
-pub async fn delete_pass(client2: &reqwest::Client, uuid: Uuid, uuid2: Uuid) -> ResultP<()> {
+pub async fn delete_pass(client2: &reqwest::Client, uuid: Uuid, uuid2: Uuid, jar: std::sync::Arc<reqwest_cookie_store::CookieStoreRwLock>) -> ResultP<()> {
+    let c = jar.read().unwrap();
+    let cookie = 
+        format!("token={}", c.iter_any().collect::<Vec<_>>()[0].value().replace("\"", ""));
     let res = client2
         .get(
             BASE_URL.to_string()
@@ -111,6 +139,7 @@ pub async fn delete_pass(client2: &reqwest::Client, uuid: Uuid, uuid2: Uuid) -> 
                 + uuid2.to_string().as_str()
                 + "/",
         )
+        .header(COOKIE,HeaderValue::from_str(cookie.as_str()).unwrap())
         .send()
         .await
         .map_err(|_| ProtocolError::DataError)?;
