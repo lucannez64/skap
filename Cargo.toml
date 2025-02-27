@@ -15,7 +15,7 @@ required-features = ["tui"]
 
 [features]
 tui = ["client", "dep:ratatui", "dep:crossterm", "dep:totp-rs", "dep:clipboard-win", "dep:cli-clipboard", "dep:otp-std"]
-server = ["dep:warp", "dep:tokio-postgres-tls", "dep:tokio-postgres", "dep:postgres-types", "dep:postgres-protocol", "dep:rustls", "dep:rustls-pemfile", "dep:rustls-rustcrypto"]
+server = ["dep:redis", "dep:warp", "dep:tokio-postgres-tls", "dep:tokio-postgres", "dep:postgres-types", "dep:postgres-protocol", "dep:rustls", "dep:rustls-pemfile", "dep:rustls-rustcrypto"]
 client = []
 
 [target.'cfg(windows)'.dependencies]
@@ -26,43 +26,47 @@ clipboard-win = {version = "5.4.0", optional = true}
 [dependencies]
 base64 = "0.22.1"
 bincode = "1.3.3"
-blake3 = { version = "1.5.4", features = ["serde"] }
-bytes = "1.8.0"
+blake3 = { version = "1.6.0", features = ["serde"] }
+bytes = "1.10.0"
 chacha20poly1305 = "0.10.1"
 cli-clipboard = { version = "0.4.0", optional = true }
 crossterm = { version = "0.28.1", optional = true }
 crystals-dilithium = "1.0.0"
-data-encoding = "2.7.0"
+data-encoding = "2.8.0"
 deadpool-postgres = "0.14.1"
 dotenv = "0.15.0"
 fips204 = "0.4.6"
 futures = "0.3.31"
 hmac = "0.12.1"
 lazy_static = "1.5.0"
-libcrux-ml-kem = "0.0.2-alpha.3"
-otp-std = { version = "0.1.0", features = ["sha2"], optional = true }
+libcrux-ml-kem = "0.0.2-beta.3"
+otp-std = { version = "0.2.3", features = ["sha2"], optional = true }
 pasetors = { version = "0.7.2", features = ["serde"] }
-postgres-protocol = { version = "0.6.7", optional = true }
-postgres-types = { version = "0.2.8", features = ["derive", "serde-1"], optional = true }
-rand = "0.8.5"
+postgres-protocol = { version = "0.6.8", optional = true }
+postgres-types = { version = "0.2.9", features = ["derive", "serde-1"], optional = true }
+rand = "0.9.0"
 ratatui = { version = "0.29.0", optional = true }
-reqwest = { version = "0.12.9", features = ["cookies"] }
+reqwest = { version = "0.12.12", features = ["cookies"] }
 reqwest_cookie_store = "0.8.0"
-ring = "0.17.8"
-rustls = { version = "0.23.21", features = ["ring"], optional = true }
+ring = "0.17.11"
+rustls = { version = "0.23.23", features = ["ring"], optional = true }
 rustls-pemfile = { version ="2.2.0", optional = true }
 rustls-rustcrypto = { version = "0.0.2-alpha", optional = true }
-serde = { version = "1.0.215", features = ["derive"] }
-serde_json = "1.0.137"
-serde_with = "3.11.0"
+serde = { version = "1.0.218", features = ["derive"] }
+serde_derive = "1.0.218"
+serde_json = "1.0.139"
+serde_with = "3.12.0"
 sha1 = "0.10.6"
 sha2 = "0.10.8"
 sharks = "0.5.0"
-thiserror = "2.0.3"
-tokio = { version = "1.41.1", features = ["full"] }
-tokio-postgres = { version = "0.7.12", features = ["with-uuid-1"], optional = true }
+thiserror = "2.0.11"
+tokio = { version = "1.43.0", features = ["full"] }
+tokio-postgres = { version = "0.7.13", features = ["with-uuid-1"], optional = true }
 tokio-postgres-tls = { version = "0.12.0", optional = true }
 totp-rs = { version = "5.6.0", features = ["otpauth", "serde_support"], optional = true }
 url = "2.5.4"
-uuid = { version = "1.11.0", features = ["v4", "serde", "fast-rng"] }
+uuid = { version = "1.15.1", features = ["v4", "serde", "fast-rng"] }
 warp = { version = "0.3.7", optional = true }
+redis = { version = "0.29.0", features = ["tokio-comp"], optional = true }
+env_logger = "0.11.6"
+log = "0.4.26"

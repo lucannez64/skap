@@ -1,12 +1,15 @@
 use base64::Engine;
 use blake3::hash;
-use rand::{rngs::StdRng, RngCore, SeedableRng};
+use rand::{rngs::StdRng, RngCore, SeedableRng, TryRngCore };
 use thiserror::Error;
 
 #[cfg(feature = "server")]
 use crate::postgres::PassesPostgres;
 #[cfg(feature = "server")]
 use crate::postgres::UsersPostgres;
+#[cfg(feature = "server")]
+use crate::postgres::SharedPassesPostgres;
+
 use bytes::BytesMut;
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
@@ -17,6 +20,12 @@ use libcrux_ml_kem::mlkem1024::{
 };
 #[cfg(feature = "server")]
 use postgres_types::{accepts, to_sql_checked, FromSql, ToSql};
+
+#[cfg(feature = "server")]
+use crate::redis::RedisChallenges;
+#[cfg(feature = "server")]
+use crate::redis::RedisSecrets;
+
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::{serde_as, Bytes};
@@ -81,7 +90,7 @@ impl From<KyPublicKey> for MlKem1024PublicKey {
 }
 
 fn random_array<const L: usize>() -> [u8; L] {
-    let mut rng = OsRng;
+    let mut rng = StdRng::from_os_rng();
     let mut seed = [0; L];
     rng.try_fill_bytes(&mut seed).unwrap();
     seed
@@ -194,13 +203,32 @@ impl CK {
     }
 }
 
+/// Structure pour un mot de passe partagé
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SharedPass {
+    /// Texte chiffré KEM généré avec la clé publique du destinataire
+    pub kem_ct: Vec<u8>,
+    /// Le mot de passe chiffré (EP) avec la clé partagée
+    pub ep: EP,
+}
+
+/// Collection pour stocker les mots de passe partagés
 #[derive(Clone)]
-pub struct Server<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> {
+pub struct SharedPasses(HashMap<(Uuid, Uuid, Uuid), Vec<u8>>);
+
+impl SharedPasses {
+    pub fn new() -> Self {
+        SharedPasses(HashMap::new())
+    }
+}
+
+pub struct Server<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> {
     users: E,
     rng: StdRng,
     challenges: D,
     secrets: T,
     passes: U,
+    shared_passes: F,
 }
 
 pub struct Secrets(HashMap<Uuid, [u8; 32]>);
@@ -268,6 +296,82 @@ pub trait PassesT {
     async fn update_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>) -> ResultP<()>;
 }
 
+
+pub trait SharedPassesT {
+    async fn store_shared_pass(
+        &mut self,
+        owner: Uuid,
+        pass_id: Uuid,
+        recipient: Uuid,
+        shared_pass: Vec<u8>,
+    ) -> ResultP<()>;
+
+    async fn get_shared_pass(
+        &self,
+        recipient: Uuid,
+        owner: Uuid,
+        pass_id: Uuid,
+    ) -> ResultP<Vec<u8>>;
+
+    async fn remove_shared_pass(
+        &mut self,
+        owner: Uuid,
+        pass_id: Uuid,
+        recipient: Uuid,
+    ) -> ResultP<()>;
+
+    async fn get_all_shared_passes(
+        &self,
+        recipient: Uuid,
+    ) -> ResultP<Vec<(Vec<u8>, Uuid, Uuid)>>;
+}
+
+
+impl SharedPassesT for SharedPasses {
+    async fn store_shared_pass(
+        &mut self,
+        owner: Uuid,
+        pass_id: Uuid,
+        recipient: Uuid,
+        shared_pass: Vec<u8>,
+    ) -> ResultP<()> {
+        self.0.insert((owner, pass_id, recipient), shared_pass);
+        Ok(())
+    }
+
+    async fn get_shared_pass(
+        &self,
+        recipient: Uuid,
+        owner: Uuid,
+        pass_id: Uuid,
+    ) -> ResultP<Vec<u8>> {
+        self.0.get(&(owner, pass_id, recipient)).cloned().ok_or(ProtocolError::StorageError)
+    }
+
+    async fn remove_shared_pass(
+        &mut self,
+        owner: Uuid,
+        pass_id: Uuid,
+        recipient: Uuid,
+    ) -> ResultP<()> {
+        self.0.remove(&(owner, pass_id, recipient));
+        Ok(())
+    }
+
+    async fn get_all_shared_passes(
+        &self,
+        recipient: Uuid,
+    ) -> ResultP<Vec<(Vec<u8>, Uuid, Uuid)>> {
+        let mut shared_passes = Vec::new();
+        for ((owner, pass_id, rec), shared_pass) in &self.0 {
+            if *rec == recipient {
+                shared_passes.push((shared_pass.clone(), *owner, *pass_id));
+            }
+        }
+        Ok(shared_passes)
+    }
+}
+
 impl PassesT for Passes {
     async fn get_pass(&self, id: Uuid, pass_id: Uuid) -> ResultP<Vec<u8>> {
         self.0
@@ -315,26 +419,30 @@ impl SecretsT for Secrets {
     }
 }
 
-impl Server<Secrets, Passes, Challenges, Users> {
+impl Server<Secrets, Passes, Challenges, Users, SharedPasses> {
     pub fn new() -> ResultP<Self> {
-        let rng = SeedableRng::from_entropy();
+        let rng = StdRng::from_os_rng();
         Ok(Server {
             users: Users::new(),
             rng,
             challenges: Challenges(HashMap::new()),
             secrets: Secrets(HashMap::new()),
             passes: Passes(HashMap::new()),
+            shared_passes: SharedPasses(HashMap::new()),
         })
     }
 }
 #[cfg(feature = "server")]
-impl Server<Secrets, PassesPostgres, Challenges, UsersPostgres> {
+impl Server<Secrets, PassesPostgres, Challenges, UsersPostgres, SharedPassesPostgres> {
     pub async fn new(postgres_url: &str, file: &str) -> ResultP<Self> {
-        let rng = SeedableRng::from_entropy();
+        let rng = StdRng::from_os_rng();
         let passes = PassesPostgres::new(postgres_url, file)
             .await
             .map_err(|_| ProtocolError::StorageError)?;
         let users = UsersPostgres::new(postgres_url, file)
+            .await
+            .map_err(|_| ProtocolError::StorageError)?;
+        let shared_passes = SharedPassesPostgres::new(postgres_url, file)
             .await
             .map_err(|_| ProtocolError::StorageError)?;
         Ok(Server {
@@ -343,16 +451,30 @@ impl Server<Secrets, PassesPostgres, Challenges, UsersPostgres> {
             challenges: Challenges(HashMap::new()),
             secrets: Secrets(HashMap::new()),
             passes,
+            shared_passes,
         })
     }
 }
 
-impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
+impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Server<T, U, D, E, F> {
     pub async fn add_user(&mut self, ck: &mut CK) -> ResultP<Uuid> {
         ck.set_id();
         let id = ck.id.unwrap();
         self.users.add_user(id.clone(), ck.clone()).await?;
         Ok(id)
+    }
+
+    pub async fn get_all_shared_passes(&self, recipient: Uuid) -> ResultP<Vec<(SharedPass, Uuid, Uuid)>> {
+        let mut shared_passes = Vec::new();
+        let mut shared_data = self.shared_passes.get_all_shared_passes(recipient).await?;
+        
+        for (data, owner_id, pass_id) in shared_data {
+            let shared_pass = bincode::deserialize(&data)
+                .map_err(|_| ProtocolError::DataError)?;
+            shared_passes.push((shared_pass, owner_id, pass_id));
+        }
+        
+        Ok(shared_passes)
     }
 
     pub async fn get_user(&self, id: Uuid) -> ResultP<CK> {
@@ -361,7 +483,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
 
     pub async fn challenge(&mut self, id: Uuid) -> ResultP<[u8; 32]> {
         let mut challenge = [0u8; 32];
-        self.rng.fill_bytes(&mut challenge);
+        self.rng.try_fill_bytes(&mut challenge).unwrap();
         let _ = self.get_user(id).await?;
         self.challenges.add_challenge(id, challenge);
         Ok(challenge)
@@ -482,6 +604,50 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT> Server<T, U, D, E> {
         let _ck = self.get_user(id).await?;
         self.passes.remove_pass(id, passid).await?;
         Ok(())
+    }
+
+    /// Stocker un mot de passe partagé
+    pub async fn store_shared_pass(
+        &mut self,
+        owner: Uuid,
+        pass_id: Uuid,
+        recipient: Uuid,
+        shared_pass: SharedPass,
+    ) -> ResultP<()> {
+        let shared_serialized = bincode::serialize(&shared_pass)
+            .map_err(|_| ProtocolError::DataError)?;
+        self.shared_passes.store_shared_pass(
+            owner,
+            pass_id,
+            recipient,
+            shared_serialized
+        ).await
+    }
+
+    /// Révoquer le partage
+    pub async fn unshare_pass(
+        &mut self,
+        owner: Uuid,
+        pass_id: Uuid,
+        recipient: Uuid,
+    ) -> ResultP<()> {
+        self.shared_passes
+            .remove_shared_pass(owner, pass_id, recipient)
+            .await
+    }
+
+    /// Récupérer un mot de passe partagé
+    pub async fn get_shared_pass(
+        &self,
+        recipient: Uuid,
+        owner: Uuid,
+        pass_id: Uuid,
+    ) -> ResultP<SharedPass> {
+        let shared_data = self.shared_passes
+            .get_shared_pass(recipient, owner, pass_id)
+            .await?;
+        bincode::deserialize(&shared_data)
+            .map_err(|_| ProtocolError::DataError)
     }
 }
 
@@ -657,6 +823,68 @@ impl Client {
         self.secret = Some(s);
         Ok(())
     }
+
+    /// Chiffrer un mot de passe pour un destinataire
+    pub fn share_encrypt(
+        &self,
+        raw_password: &Password,
+        recipient_ky_p: &KyPublicKey,
+    ) -> ResultP<SharedPass> {
+        // Encapsuler une clé partagée avec la clé publique du destinataire
+        let kem_rand = random_array();
+        let recipient_pk: MlKem1024PublicKey = recipient_ky_p.clone().into();
+        let (kem_ct, shared_secret) = mlkem1024::encapsulate(&recipient_pk, kem_rand);
+
+        // Dériver une clé symétrique
+        let hash = hash(&shared_secret);
+        let shared_key: &Key = Key::from_slice(hash.as_bytes());
+        let shared_cipher = XChaCha20Poly1305::new(shared_key);
+        let shared_nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+
+        // Chiffrer le mot de passe
+        let password_ser = bincode::serialize(&raw_password)
+            .map_err(|_| ProtocolError::DataError)?;
+        let shared_ct = shared_cipher
+            .encrypt(&shared_nonce, password_ser.as_slice())
+            .map_err(|_| ProtocolError::CryptoError)?;
+
+        Ok(SharedPass {
+            kem_ct: kem_ct.as_slice().to_vec(),
+            ep: EP {
+                ciphertext: shared_ct,
+                nonce: shared_nonce.to_vec(),
+                nonce2: None,
+            },
+        })
+    }
+
+    /// Déchiffrer un mot de passe partagé
+    pub fn decrypt_shared(&self, shared_pass: SharedPass) -> ResultP<Password> {
+        // Décapsuler la clé partagée
+        let kem_ct = shared_pass.kem_ct.as_slice();
+        if kem_ct.len() != 1568 {
+            return Err(ProtocolError::DataError);
+        }
+        let kem_array: &[u8; 1568] = kem_ct.try_into()
+            .map_err(|_| ProtocolError::DataError)?;
+        let kem_cipher = MlKem1024Ciphertext::from(kem_array);
+        let shared_secret = mlkem1024::decapsulate(
+            &MlKem1024PrivateKey::from(&self.ky_q),
+            &kem_cipher,
+        );
+
+        // Déchiffrer le mot de passe
+        let hash = hash(&shared_secret);
+        let shared_key: &Key = Key::from_slice(hash.as_bytes());
+        let shared_cipher = XChaCha20Poly1305::new(shared_key);
+        let nonce = XNonce::from_slice(&shared_pass.ep.nonce);
+        let decrypted_bytes = shared_cipher
+            .decrypt(nonce, shared_pass.ep.ciphertext.as_slice())
+            .map_err(|_| ProtocolError::CryptoError)?;
+
+        bincode::deserialize(&decrypted_bytes)
+            .map_err(|_| ProtocolError::DataError)
+    }
 }
 
 #[derive(Clone)]
@@ -727,5 +955,84 @@ impl Shards {
             .recover(&slice)
             .map_err(|_| ProtocolError::CryptoError);
         secret
+    }
+}
+
+#[cfg(feature = "server")]
+impl Server<RedisSecrets, PassesPostgres, RedisChallenges, UsersPostgres, SharedPassesPostgres> {
+    pub async fn new_with_redis(postgres_url: &str, redis_url: &str, file: &str) -> ResultP<Self> {
+        let rng = StdRng::from_os_rng();
+        let passes = PassesPostgres::new(postgres_url, file)
+            .await
+            .map_err(|_| ProtocolError::StorageError)?;
+        let users = UsersPostgres::new(postgres_url, file)
+            .await
+            .map_err(|_| ProtocolError::StorageError)?;
+        let secrets = RedisSecrets::new(redis_url)
+            .map_err(|_| ProtocolError::StorageError)?;
+        let challenges = RedisChallenges::new(redis_url)
+            .map_err(|_| ProtocolError::StorageError)?;
+        let shared_passes = SharedPassesPostgres::new(postgres_url, file)
+            .await
+            .map_err(|_| ProtocolError::StorageError)?;
+
+        Ok(Server {
+            users,
+            rng,
+            challenges,
+            secrets,
+            passes,
+            shared_passes,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_client_creation() {
+        let client = Client::new();
+        assert!(client.is_ok());
+        let client = client.unwrap();
+        assert!(client.secret.is_none());
+    }
+
+    #[test]
+    fn test_password_encryption() {
+        let client = Client::new().unwrap();
+        let pass = Password {
+            username: "test".to_string(),
+            password: "password123".to_string(),
+            app_id: None,
+            description: None,
+            url: Some("https://example.com".to_string()),
+            otp: None,
+        };
+
+        let encrypted = client.encrypt(pass.clone());
+        assert!(encrypted.is_ok());
+        let ep = encrypted.unwrap();
+        assert!(!ep.ciphertext.is_empty());
+        assert!(!ep.nonce.is_empty());
+        assert!(ep.nonce2.is_none());
+    }
+
+    #[test]
+    fn test_shards() {
+        let secret = b"test secret";
+        let shards = Shards::new(5, secret);
+        let recovered = shards.clone().recover();
+        assert!(recovered.is_ok());
+        assert_eq!(recovered.unwrap(), secret);
+    }
+
+    #[test]
+    fn test_client_signing() {
+        let client = Client::new().unwrap();
+        let challenge = b"test challenge";
+        let signature = client.sign(challenge);
+        assert_eq!(signature.len(), ml_dsa_87::SIG_LEN);
     }
 }

@@ -1,6 +1,7 @@
 mod postgres;
 mod protocol;
 mod server;
+mod redis;
 
 use dotenv::dotenv;
 

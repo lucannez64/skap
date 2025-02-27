@@ -350,7 +350,7 @@ async fn handle_main_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
                     if let Ok(passwords) =
                         client::get_all(client2, client.1.id.unwrap(), &mut client.0, Arc::clone(&jar)).await
                     {
-                        app.password_list.items = passwords;
+                        app.password_list.items = passwords.0;
                         app.current_screen = CurrentScreen::ViewingPasswords;
                     }
                 }
@@ -998,5 +998,55 @@ impl TOTP {
             code_bytes[3],
         ]) % 10u32.pow(self.digits.into());
         format!("{:0digits$}", code, digits = self.digits as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_totp_from_uri() {
+        let uri = "otpauth://totp/Test:test@test.com?secret=JBSWY3DPEHPK3PXP&issuer=Test&algorithm=SHA1&digits=6&period=30";
+        let totp = TOTP::from_uri(uri);
+        
+        assert_eq!(totp.secret, "JBSWY3DPEHPK3PXP");
+        assert_eq!(totp.digits, 6);
+        assert_eq!(totp.period, 30);
+        assert_eq!(totp.algorithm, "SHA1");
+    }
+
+    #[test]
+    fn test_totp_generation() {
+        let uri = "otpauth://totp/Test:test@test.com?secret=JBSWY3DPEHPK3PXP&issuer=Test&algorithm=SHA1&digits=6&period=30";
+        let totp = TOTP::from_uri(uri);
+        
+        let code = totp.generate();
+        assert_eq!(code.len(), 6);
+        assert!(code.chars().all(|c| c.is_digit(10)));
+    }
+
+    #[test]
+    fn test_json_password_conversion() {
+        let json = r#"[
+            {
+                "username": "test",
+                "mdp": "password123",
+                "name": "example.com",
+                "otp": ""
+            }
+        ]"#;
+
+        std::fs::write("test.json", json).unwrap();
+        let result = jsonfile_to_vec("test.json".to_string());
+        std::fs::remove_file("test.json").unwrap();
+
+        assert!(result.is_ok());
+        let passwords = result.unwrap();
+        assert_eq!(passwords.len(), 1);
+        assert_eq!(passwords[0].username, "test");
+        assert_eq!(passwords[0].password, "password123");
+        assert_eq!(passwords[0].url, Some("example.com".to_string()));
+        assert_eq!(passwords[0].otp, None);
     }
 }

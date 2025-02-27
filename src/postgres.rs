@@ -1,9 +1,10 @@
 use std::{fs::File, str::FromStr};
 
-use crate::protocol::{PassesT, ProtocolError, ResultP, UsersT};
+use crate::protocol::{PassesT, ProtocolError, ResultP, UsersT, SharedPassesT};
 use tokio_postgres::Error;
 use deadpool_postgres::{tokio_postgres, GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod};
 use tokio_postgres_tls::MakeRustlsConnect;
+use uuid::Uuid;
 
 pub struct Database {
     pool: Pool,
@@ -218,5 +219,141 @@ impl PassesT for PassesPostgres {
                 ProtocolError::StorageError
             })?;
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+}
+
+pub struct SharedPassesPostgres {
+    pub database: Database,
+}
+
+impl SharedPassesPostgres {
+    pub async fn new(url: &str, file: &str) -> Result<SharedPassesPostgres, Error> {
+        Ok(SharedPassesPostgres {
+            database: Database::new(url, file).await?,
+        })
+    }
+}
+
+// Trait pour gérer les mots de passe partagés
+impl SharedPassesT for SharedPassesPostgres {
+    async fn store_shared_pass(
+        &mut self,
+        owner: Uuid,
+        pass_id: Uuid,
+        recipient: Uuid,
+        shared_pass: Vec<u8>,
+    ) -> ResultP<()> {
+        let database = self.database.get().await?;
+        let stmt = database
+            .prepare_cached(
+                "INSERT INTO shared_passes (owner_id, pass_id, recipient_id, data) 
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .await
+            .map_err(|e| {
+                eprintln!("Error preparing statement: {}", e);
+                ProtocolError::StorageError
+            })?;
+
+        database
+            .execute(&stmt, &[&owner, &pass_id, &recipient, &shared_pass])
+            .await
+            .map_err(|e| {
+                eprintln!("Error storing shared pass: {}", e);
+                ProtocolError::StorageError
+            })?;
+        Ok(())
+    }
+
+    async fn get_shared_pass(
+        &self,
+        recipient: Uuid,
+        owner: Uuid,
+        pass_id: Uuid,
+    ) -> ResultP<Vec<u8>> {
+        let database = self.database.get().await?;
+        let stmt = database
+            .prepare_cached(
+                "SELECT data FROM shared_passes 
+                 WHERE owner_id = $1 AND pass_id = $2 AND recipient_id = $3",
+            )
+            .await
+            .map_err(|e| {
+                eprintln!("Error preparing statement: {}", e);
+                ProtocolError::StorageError
+            })?;
+
+        let row = database
+            .query_one(&stmt, &[&owner, &pass_id, &recipient])
+            .await
+            .map_err(|e| {
+                eprintln!("Error getting shared pass: {}", e);
+                ProtocolError::StorageError
+            })?;
+
+        Ok(row.get(0))
+    }
+
+    async fn remove_shared_pass(
+        &mut self,
+        owner: Uuid,
+        pass_id: Uuid,
+        recipient: Uuid,
+    ) -> ResultP<()> {
+        let database = self.database.get().await?;
+        let stmt = database
+            .prepare_cached(
+                "DELETE FROM shared_passes 
+                 WHERE owner_id = $1 AND pass_id = $2 AND recipient_id = $3",
+            )
+            .await
+            .map_err(|e| {
+                eprintln!("Error preparing statement: {}", e);
+                ProtocolError::StorageError
+            })?;
+
+        database
+            .execute(&stmt, &[&owner, &pass_id, &recipient])
+            .await
+            .map_err(|e| {
+                eprintln!("Error removing shared pass: {}", e);
+                ProtocolError::StorageError
+            })?;
+        Ok(())
+    }
+    
+    async fn get_all_shared_passes(
+        &self,
+        recipient: Uuid,
+    ) -> ResultP<Vec<(Vec<u8>, Uuid, Uuid)>> {
+        let database = self.database.get().await?;
+        let stmt = database
+            .prepare_cached(
+                "SELECT data, pass_id, owner_id FROM shared_passes 
+                 WHERE recipient_id = $1",
+            )
+            .await
+            .map_err(|e| {
+                eprintln!("Error preparing statement: {}", e);
+                ProtocolError::StorageError
+            })?;
+
+        let rows = database
+            .query(&stmt, &[&recipient])
+            .await
+            .map_err(|e| {
+                eprintln!("Error getting all shared passes: {}", e);
+                ProtocolError::StorageError
+            })?;
+
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            let data: Vec<u8> = row.get(0);
+            let pass_id: Uuid = row.get(1);
+            let owner_id: Uuid = row.get(2);
+            result.push((data, pass_id, owner_id));
+        }
+
+        Ok(result)
     }
 }
