@@ -149,24 +149,73 @@ fn auth_error() -> Result< Response,Infallible> {
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    
+    // Amélioration de la configuration des logs
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+        .format(|buf, record| {
+            use std::io::Write;
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            writeln!(
+                buf,
+                "[{} {} {}:{}] {}",
+                timestamp,
+                record.level(),
+                record.file().unwrap_or("unknown"),
+                record.line().unwrap_or(0),
+                record.args()
+            )
+        })
+        .init();
+        
     let redis_url = std::env::var("REDIS_URL").expect("REDIS_URL must be set");
+    log::info!("Redis URL configured: {}", redis_url);
+    
     let ca = std::env::var("CA_FILE").expect("CA must be set");
+    log::info!("CA file configured: {}", ca);
+    
+    log::info!("Creating server instance...");
     let server2 = Arc::new(RwLock::new(
-        Server2::<RedisSecrets, PassesPostgres, RedisChallenges, UsersPostgres, SharedPassesPostgres>::new_with_redis(&database_url, &redis_url, &ca)
-            .await
-            .unwrap(),
+        match Server2::<RedisSecrets, PassesPostgres, RedisChallenges, UsersPostgres, SharedPassesPostgres>::new_with_redis(&database_url, &redis_url, &ca).await {
+            Ok(server) => {
+                log::info!("Server instance created successfully");
+                server
+            },
+            Err(e) => {
+                log::error!("Failed to create server instance: {:?}", e);
+                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Server initialization error: {:?}", e))));
+            }
+        },
     ));
+    
     let mut sk: SymmetricKey<V4>;
     if std::env::var("BASE64_KEY").is_err() {
-        sk = SymmetricKey::<V4>::generate().unwrap();
         log::warn!("BASE64_KEY not set, generating new key");
+        sk = match SymmetricKey::<V4>::generate() {
+            Ok(key) => key,
+            Err(e) => {
+                log::error!("Failed to generate symmetric key: {:?}", e);
+                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Key generation error: {:?}", e))));
+            }
+        };
         log::info!("Generated BASE64_KEY: {}", base64::engine::general_purpose::STANDARD.encode(sk.as_bytes()));
     } else {
         let base64k = std::env::var("BASE64_KEY").expect("BASE64_KEY must be set");
-        let skbytes = STANDARD.decode(&base64k).unwrap();
-        sk = SymmetricKey::<V4>::from(&skbytes).unwrap();
-        log::info!("Using provided BASE64_KEY");
+        log::info!("Using provided BASE64_KEY (length: {})", base64k.len());
+        let skbytes = match STANDARD.decode(&base64k) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::error!("Failed to decode BASE64_KEY: {:?}", e);
+                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Key decoding error: {:?}", e))));
+            }
+        };
+        sk = match SymmetricKey::<V4>::from(&skbytes) {
+            Ok(key) => key,
+            Err(e) => {
+                log::error!("Failed to create symmetric key from bytes: {:?}", e);
+                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Key creation error: {:?}", e))));
+            }
+        };
+        log::info!("Successfully loaded symmetric key from BASE64_KEY");
     }
 
     let mutexsk = Arc::new(RwLock::new(sk));
@@ -521,7 +570,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .or(unshare_pass_json)
         .or(get_shared_pass)
         .or(get_shared_pass_json);
+    
+    // Ajout de logs pour les routes
+    log::info!("Setting up server routes...");
+    
+    log::info!("Starting server on 127.0.0.1:3030...");
     warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
+    log::info!("Server shutdown");
     Ok(())
 }
 
@@ -939,13 +994,19 @@ async fn sync_json_map(uui: String, server2: &ServerArc) -> Result<Response, Inf
         Err(_) => Ok(ApiError::InternalError("Failed to sync data".to_string()).into())
     }
 }
+
 async fn create_user_map(
     body: bytes::Bytes,
     server2: &ServerArc,
 ) -> Result<Response, Infallible> {
+    log::debug!("Attempting to deserialize user data, length: {}", body.len());
     let ck = match bincode::deserialize::<CK>(&body) {
-        Ok(ck) => ck,
-        Err(_) => {
+        Ok(ck) => {
+            log::debug!("Successfully deserialized user data with email: {}", ck.email);
+            ck
+        },
+        Err(e) => {
+            log::error!("Failed to deserialize user data: {:?}", e);
             return Ok(ApiError::BadRequest(
                 "Invalid user data format".to_string(),
             ).into())
@@ -953,17 +1014,27 @@ async fn create_user_map(
     };
 
     let mut server = server2.write().await;
+    log::info!("Adding new user with email: {}", ck.email);
     match server.add_user(&mut ck.clone()).await {
         Ok(uuid) => {
-            println!("User created with uuid {} && name {}", uuid, ck.email);
+            log::info!("User created successfully with uuid {} and email {}", uuid, ck.email);
             match bincode::serialize(&ck) {
-                Ok(serialized) => Ok(warp::reply::Response::new(serialized.into())),
-                Err(_) => Ok(ApiError::InternalError(
-                    "Failed to serialize user data".to_string(),
-                ).into())
+                Ok(serialized) => {
+                    log::debug!("User data serialized successfully, length: {}", serialized.len());
+                    Ok(warp::reply::Response::new(serialized.into()))
+                },
+                Err(e) => {
+                    log::error!("Failed to serialize user data: {:?}", e);
+                    Ok(ApiError::InternalError(
+                        "Failed to serialize user data".to_string(),
+                    ).into())
+                }
             }
         }
-        Err(_) => Ok(ApiError::InternalError("Failed to create user".to_string()).into())
+        Err(e) => {
+            log::error!("Failed to create user: {:?}", e);
+            Ok(ApiError::InternalError("Failed to create user".to_string()).into())
+        }
     }
 }
 
