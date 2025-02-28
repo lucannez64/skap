@@ -1,7 +1,6 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-
     // Définir les drapeaux Rust
     const rust_flags = "-C target-feature=+aes,+avx2,+sse2,+sse4.1,+bmi2,+popcnt";
 
@@ -15,12 +14,20 @@ pub fn build(b: *std.Build) void {
 
     // Cible pour construire le serveur
     const server_step = b.step("server", "Build server version");
-    const server_cmd = b.addSystemCommand(&[_][]const u8{
-        "cargo", "+nightly",    "build",      "-Zbuild-std", "--release",
-        "--bin", "skap-server", "--features", "server",
-    });
+    const server_step_linux = b.step("server-linux", "Build server version for Linux");
+    const server_step_windows = b.step("server-windows", "Build server version for Windows");
+
+    const server_cmd = build_server(b, false);
     server_cmd.setEnvironmentVariable("RUSTFLAGS", rust_flags);
     server_step.dependOn(&server_cmd.step);
+
+    const server_cmd_linux = build_server(b, true);
+    server_cmd_linux.setEnvironmentVariable("RUSTFLAGS", rust_flags);
+    server_step_linux.dependOn(&server_cmd_linux.step);
+
+    const server_cmd_windows = build_server(b, false);
+    server_cmd_windows.setEnvironmentVariable("RUSTFLAGS", rust_flags);
+    server_step_windows.dependOn(&server_cmd_windows.step);
 
     // Cible pour construire le TUI
     const tui_step = b.step("tui", "Build TUI version");
@@ -33,10 +40,10 @@ pub fn build(b: *std.Build) void {
 
     // Cible pour exécuter le serveur
     const run_server_step = b.step("run-server", "Build and run server");
-    run_server_step.dependOn(server_step);
     const run_server_cmd = b.addSystemCommand(&[_][]const u8{
         "./target/release/skap-server",
     });
+    run_server_cmd.step.dependOn(@constCast(server_step));
     run_server_step.dependOn(&run_server_cmd.step);
 
     // Cible pour exécuter le TUI
@@ -73,6 +80,8 @@ pub fn build(b: *std.Build) void {
     const docker_build_cmd = b.addSystemCommand(&[_][]const u8{
         "docker-compose", "build",
     });
+    docker_build_cmd.setEnvironmentVariable("DOCKER_BUILDKIT", "1");
+    docker_build_cmd.setEnvironmentVariable("COMPOSE_DOCKER_CLI_BUILD", "1");
     docker_build_step.dependOn(&docker_build_cmd.step);
 
     // Cible pour exécuter les services Docker
@@ -98,4 +107,18 @@ pub fn build(b: *std.Build) void {
 
     // Définir la cible par défaut
     b.default_step.dependOn(release_step);
+}
+
+fn build_server(b: *std.Build, linux: bool) *std.Build.Step.Run {
+    var server_cmd: *std.Build.Step.Run = undefined;
+    if (linux) {
+        server_cmd = b.addSystemCommand(&[_][]const u8{
+            "cargo",                    "+nightly",    "build",      "-Zbuild-std", "--release",
+            "--bin",                    "skap-server", "--features", "server",      "--target",
+            "x86_64-unknown-linux-gnu",
+        });
+    } else {
+        server_cmd = b.addSystemCommand(&[_][]const u8{ "cargo", "+nightly", "build", "-Zbuild-std", "--release", "--bin", "skap-server", "--features", "server" });
+    }
+    return server_cmd;
 }

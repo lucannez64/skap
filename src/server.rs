@@ -44,7 +44,7 @@ enum ApiError {
 impl warp::reject::Reject for ApiError {}
 
 impl ApiError {
-    fn to_response(&self) -> Response {
+    fn to_response(&self, is_json: bool) -> Response {
         let (code, message) = match self {
             ApiError::BadRequest(msg) => (400, msg),
             ApiError::Unauthorized(msg) => (401, msg),
@@ -52,12 +52,7 @@ impl ApiError {
             ApiError::AuthenticationFailed(msg) => (401, msg),
         };
 
-        // Obtenir la stack trace pour déterminer la fonction appelante
-        let backtrace = std::backtrace::Backtrace::capture();
-        let is_json_route = backtrace.to_string().contains("_json_map");
-        log::info!("is_json_route: {}", is_json_route);
-
-        if is_json_route {
+        if is_json {
             // Pour les routes JSON
             let json = warp::reply::json(&ErrorMessage {
                 code: code,
@@ -78,35 +73,11 @@ impl ApiError {
 
     // Méthodes d'aide pour créer des réponses spécifiques au format
     fn to_json_response(&self) -> Response {
-        let (code, message) = match self {
-            ApiError::BadRequest(msg) => (400, msg),
-            ApiError::Unauthorized(msg) => (401, msg),
-            ApiError::InternalError(msg) => (500, msg),
-            ApiError::AuthenticationFailed(msg) => (401, msg),
-        };
-
-        let json = warp::reply::json(&ErrorMessage {
-            code: code,
-            message: message.to_string(),
-        });
-        warp::reply::with_status(json, warp::http::StatusCode::from_u16(code).unwrap())
-            .into_response()
+        self.to_response(true)
     }
 
     fn to_binary_response(&self) -> Response {
-        let (code, message) = match self {
-            ApiError::BadRequest(msg) => (400, msg),
-            ApiError::Unauthorized(msg) => (401, msg),
-            ApiError::InternalError(msg) => (500, msg),
-            ApiError::AuthenticationFailed(msg) => (401, msg),
-        };
-
-        let error_response = bincode::serialize(&message).unwrap_or_default();
-        warp::reply::with_status(
-            warp::reply::Response::new(error_response.into()),
-            warp::http::StatusCode::from_u16(code).unwrap(),
-        )
-        .into_response()
+        self.to_response(false)
     }
 }
 
@@ -118,7 +89,7 @@ impl From<ApiError> for Infallible {
 
 impl From<ApiError> for Response {
     fn from(error: ApiError) -> Self {
-        error.to_response()
+        error.to_response(false)
     }
 }
 
@@ -132,34 +103,34 @@ async fn auth_validation(
     sk: Arc<RwLock<SymmetricKey<V4>>>,
     uuid: &str,
     token: String,
+    is_json: bool,
 ) -> Result<(), Response> {
     let sk = sk.read().await;
     let validation = ClaimsValidationRules::new();
-
     let untrusted_token = UntrustedToken::<Local, V4>::try_from(&token)
-        .map_err(|_| ApiError::Unauthorized("Invalid token format".to_string()).to_response())?;
+        .map_err(|_| ApiError::Unauthorized("Invalid token format".to_string()).to_response(is_json))?;
 
     let trusted_token = local::decrypt(&sk, &untrusted_token, &validation, None, Some(b"skap"))
-        .map_err(|_| ApiError::Unauthorized("Token validation failed".to_string()).to_response())?;
+        .map_err(|_| ApiError::Unauthorized("Token validation failed".to_string()).to_response(is_json))?;
 
     let claims = trusted_token
         .payload_claims()
-        .ok_or_else(|| ApiError::Unauthorized("No claims in token".to_string()).to_response())?;
+        .ok_or_else(|| ApiError::Unauthorized("No claims in token".to_string()).to_response(is_json))?;
 
     let sub = claims
         .get_claim("sub")
         .ok_or_else(|| {
-            ApiError::Unauthorized("No subject claim in token".to_string()).to_response()
+            ApiError::Unauthorized("No subject claim in token".to_string()).to_response(is_json)
         })?
         .as_str()
         .ok_or_else(|| {
-            ApiError::Unauthorized("Invalid subject claim format".to_string()).to_response()
+            ApiError::Unauthorized("Invalid subject claim format".to_string()).to_response(is_json)
         })?;
 
     if uuid.replace("-", "").replace("\"", "") == sub.replace("-", "").replace("\"", "") {
         Ok(())
     } else {
-        Err(ApiError::Unauthorized("UUID mismatch".to_string()).to_response())
+        Err(ApiError::Unauthorized("UUID mismatch".to_string()).to_response(is_json))
     }
 }
 
@@ -288,7 +259,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                  server2: ServerArc,
                  sk: Arc<RwLock<SymmetricKey<V4>>>,
                  token: String| async move {
-                    if let Err(response) = auth_validation(sk, &uui, token).await {
+                    if let Err(response) = auth_validation(sk, &uui, token, false).await {
                         return Ok(response);
                     }
                     send_all_map(uui, &server2).await
@@ -307,7 +278,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                  server2: ServerArc,
                  sk: Arc<RwLock<SymmetricKey<V4>>>,
                  token: String| async move {
-                    if let Err(response) = auth_validation(sk, &uui, token).await {
+                    if let Err(response) = auth_validation(sk, &uui, token, true).await {
                         return Ok(response);
                     }
                     send_all_json_map(uui, &server2).await
@@ -334,7 +305,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                  server2: ServerArc,
                  sk: Arc<RwLock<SymmetricKey<V4>>>,
                  token: String| async move {
-                    if let Err(response) = auth_validation(sk, &uui, token).await {
+                    if let Err(response) = auth_validation(sk, &uui, token, true).await {
                         return Ok(response);
                     }
                     sync_json_map(uui, &server2).await
@@ -353,7 +324,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                  server2: ServerArc,
                  sk: Arc<RwLock<SymmetricKey<V4>>>,
                  token: String| async move {
-                    if let Err(response) = auth_validation(sk, &uui, token).await {
+                    if let Err(response) = auth_validation(sk, &uui, token, false).await {
                         return Ok(response);
                     }
                     sync_map(uui, &server2).await
@@ -373,7 +344,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
              token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token).await {
+                if let Err(response) = auth_validation(sk, &uui, token, false).await {
                     return Ok(response);
                 }
                 create_pass_map(uui, pass, &server2).await
@@ -393,7 +364,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
              token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token).await {
+                if let Err(response) = auth_validation(sk, &uui, token, true).await {
                     return Ok(response);
                 }
                 create_pass_json_map(uui, pass, &server2).await
@@ -461,7 +432,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
              token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token).await {
+                if let Err(response) = auth_validation(sk, &uui, token, false).await {
                     return Ok(response);
                 }
                 update_pass_map(uui, uui2, pass, &server2).await
@@ -483,7 +454,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
              token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token).await {
+                if let Err(response) = auth_validation(sk, &uui, token, true).await {
                     return Ok(response);
                 }
                 update_pass_json_map(uui, uui2, pass, &server2).await
@@ -503,7 +474,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
              token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token).await {
+                if let Err(response) = auth_validation(sk, &uui, token, false).await {
                     return Ok(response);
                 }
                 delete_map(uui, uui2, &server2).await
@@ -523,7 +494,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
              token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token).await {
+                if let Err(response) = auth_validation(sk, &uui, token, true).await {
                     return Ok(response);
                 }
                 delete_json_map(uui, uui2, &server2).await
@@ -543,7 +514,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
              token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token).await {
+                if let Err(response) = auth_validation(sk, &uui, token, false).await {
                     return Ok(response);
                 }
                 send_map(uui, uui2, &server2).await
@@ -563,7 +534,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
              token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token).await {
+                if let Err(response) = auth_validation(sk, &uui, token, true).await {
                     return Ok(response);
                 }
                 send_json_map(uui, uui2, &server2).await
@@ -587,7 +558,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
              token: String| async move {
-                if let Err(response) = auth_validation(sk, &owner, token).await {
+                if let Err(response) = auth_validation(sk, &owner, token, false).await {
                     return Ok(response);
                 }
                 share_pass_map(owner, pass_id, recipient, shared_pass, &server2).await
@@ -611,7 +582,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
              token: String| async move {
-                if let Err(response) = auth_validation(sk, &owner, token).await {
+                if let Err(response) = auth_validation(sk, &owner, token, true).await {
                     return Ok(response);
                 }
                 share_pass_json_map(owner, pass_id, recipient, shared_pass, &server2).await
@@ -633,7 +604,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
              token: String| async move {
-                if let Err(response) = auth_validation(sk, &owner, token).await {
+                if let Err(response) = auth_validation(sk, &owner, token, false).await {
                     return Ok(response);
                 }
                 unshare_pass_map(owner, pass_id, recipient, &server2).await
@@ -655,7 +626,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
              token: String| async move {
-                if let Err(response) = auth_validation(sk, &owner, token).await {
+                if let Err(response) = auth_validation(sk, &owner, token, true).await {
                     return Ok(response);
                 }
                 unshare_pass_json_map(owner, pass_id, recipient, &server2).await
@@ -677,7 +648,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
              token: String| async move {
-                if let Err(response) = auth_validation(sk, &recipient, token).await {
+                if let Err(response) = auth_validation(sk, &recipient, token, false).await {
                     return Ok(response);
                 }
                 get_shared_pass_map(recipient, owner, pass_id, &server2).await
@@ -699,7 +670,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
              token: String| async move {
-                if let Err(response) = auth_validation(sk, &recipient, token).await {
+                if let Err(response) = auth_validation(sk, &recipient, token, true).await {
                     return Ok(response);
                 }
                 get_shared_pass_json_map(recipient, owner, pass_id, &server2).await
@@ -774,7 +745,7 @@ async fn delete_map(
         Ok(uuid) => uuid,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for user ID".to_string()).to_response(),
+                ApiError::BadRequest("Invalid UUID format for user ID".to_string()).to_response(false),
             )
         }
     };
@@ -782,7 +753,7 @@ async fn delete_map(
         Ok(uuid2) => uuid2,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(),
+                ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(false),
             )
         }
     };
@@ -810,7 +781,7 @@ async fn delete_json_map(
         Ok(uuid) => uuid,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for user ID".to_string()).to_response(),
+                ApiError::BadRequest("Invalid UUID format for user ID".to_string()).to_response(true),
             )
         }
     };
@@ -819,14 +790,14 @@ async fn delete_json_map(
         Ok(uuid2) => uuid2,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(),
+                ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true),
             )
         }
     };
 
     match server.delete_pass(id, id2).await {
         Ok(()) => Ok(warp::reply::json(&"Pass deleted successfully").into_response()),
-        Err(_) => Ok(ApiError::InternalError("Failed to delete pass".to_string()).to_response()),
+        Err(_) => Ok(ApiError::InternalError("Failed to delete pass".to_string()).to_response(true)),
     }
 }
 
@@ -837,7 +808,7 @@ async fn challenge_map(uui: String, server2: &ServerArc) -> Result<Response, Inf
         Ok(uuid) => uuid,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(),
+                ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(false),
             )
         }
     };
@@ -848,12 +819,12 @@ async fn challenge_map(uui: String, server2: &ServerArc) -> Result<Response, Inf
             Err(_) => {
                 return Ok(
                     ApiError::InternalError("Failed to serialize challenge".to_string())
-                        .to_response(),
+                        .to_response(false),
                 )
             }
         },
         Err(_) => {
-            Ok(ApiError::InternalError("Failed to generate challenge".to_string()).to_response())
+            Ok(ApiError::InternalError("Failed to generate challenge".to_string()).to_response(false))
         }
     }
 }
@@ -863,12 +834,12 @@ async fn challenge_json_map(uui: String, server2: &ServerArc) -> Result<Response
 
     let id = match uuid::Uuid::parse_str(&uui) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).into()),
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
     };
 
     match server.challenge(id).await {
         Ok(challenge) => Ok(warp::reply::json(&challenge).into_response()),
-        Err(_) => Ok(ApiError::InternalError("Failed to generate challenge".to_string()).into()),
+        Err(_) => Ok(ApiError::InternalError("Failed to generate challenge".to_string()).to_response(true)),
     }
 }
 
@@ -939,7 +910,7 @@ async fn verify_json_map(
 
     let id = match uuid::Uuid::parse_str(&uui) {
         Ok(id) => id,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response()),
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
     };
 
     match server.verify(id.clone(), body.as_slice()).await {
@@ -950,7 +921,7 @@ async fn verify_json_map(
                 Err(_) => {
                     return Ok(
                         ApiError::InternalError("Failed to create claims".to_string())
-                            .to_response(),
+                            .to_response(true),
                     )
                 }
             };
@@ -958,7 +929,7 @@ async fn verify_json_map(
             if let Err(_) = claims.subject(&id.to_string()) {
                 return Ok(
                     ApiError::InternalError("Failed to set subject claim".to_string())
-                        .to_response(),
+                        .to_response(true),
                 );
             }
 
@@ -966,7 +937,7 @@ async fn verify_json_map(
                 Ok(token) => token,
                 Err(_) => {
                     return Ok(
-                        ApiError::InternalError("Failed to create token".to_string()).to_response(),
+                        ApiError::InternalError("Failed to create token".to_string()).to_response(true),
                     )
                 }
             };
@@ -982,7 +953,7 @@ async fn verify_json_map(
             .into_response())
         }
         Err(_) => {
-            Ok(ApiError::AuthenticationFailed("Authentication failed".to_string()).to_response())
+            Ok(ApiError::AuthenticationFailed("Authentication failed".to_string()).to_response(true))
         }
     }
 }
@@ -1031,20 +1002,20 @@ async fn update_pass_json_map(
     let id = match uuid::Uuid::parse_str(&uui) {
         Ok(uuid) => uuid,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for user ID".to_string()).into())
+            return Ok(ApiError::BadRequest("Invalid UUID format for user ID".to_string()).to_response(true))
         }
     };
 
     let id2 = match uuid::Uuid::parse_str(&uui2) {
         Ok(uuid2) => uuid2,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).into())
+            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true))
         }
     };
 
     match server.update_pass(id, id2, pass).await {
         Ok(()) => Ok(warp::reply::json(&id2).into_response()),
-        Err(_) => Ok(ApiError::InternalError("Failed to update pass".to_string()).into()),
+        Err(_) => Ok(ApiError::InternalError("Failed to update pass".to_string()).to_response(true)),
     }
 }
 
@@ -1073,20 +1044,20 @@ async fn send_json_map(
     let id = match uuid::Uuid::parse_str(&uui) {
         Ok(uuid) => uuid,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for user ID".to_string()).into())
+            return Ok(ApiError::BadRequest("Invalid UUID format for user ID".to_string()).to_response(true))
         }
     };
 
     let id2 = match uuid::Uuid::parse_str(&uui2) {
         Ok(uuid2) => uuid2,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).into())
+            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true))
         }
     };
 
     match server.send(id, id2).await {
         Ok(r) => Ok(warp::reply::json(&r).into_response()),
-        Err(_) => Ok(ApiError::InternalError("Failed to send pass".to_string()).into()),
+        Err(_) => Ok(ApiError::InternalError("Failed to send pass".to_string()).to_response(true)),
     }
 }
 
@@ -1097,7 +1068,9 @@ async fn create_pass_map(
 ) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui);
+    log::warn!("Creating pass for user: {}", uui);
     let ep = bincode::deserialize::<EP>(&pass);
+    log::warn!("EP: {:?}", ep);
     if id.is_err() || ep.is_err() {
         return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).into());
     }
@@ -1115,15 +1088,19 @@ async fn create_pass_json_map(
     server2: &ServerArc,
 ) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
-
+    log::info!("Creating pass for user: {}", uui);
+    log::info!("Pass: {:?}", pass);
     let id = match uuid::Uuid::parse_str(&uui) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response()),
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
     };
 
     match server.create_pass(id, pass).await {
         Ok(id2) => Ok(warp::reply::json(&id2).into_response()),
-        Err(_) => Ok(ApiError::InternalError("Failed to create pass".to_string()).to_response()),
+        Err(e) => {
+            log::error!("Failed to create pass : {}", e);
+            Ok(ApiError::InternalError("Failed to create pass".to_string()).to_response(true))
+        }
     }
 }
 
@@ -1146,12 +1123,12 @@ async fn sync_json_map(uui: String, server2: &ServerArc) -> Result<Response, Inf
 
     let id = match uuid::Uuid::parse_str(&uui) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).into()),
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
     };
 
     match server.sync(id).await {
         Ok(ciphertextsync) => Ok(warp::reply::json(&ciphertextsync.to_vec()).into_response()),
-        Err(_) => Ok(ApiError::InternalError("Failed to sync data".to_string()).into()),
+        Err(_) => Ok(ApiError::InternalError("Failed to sync data".to_string()).to_response(true)),
     }
 }
 
@@ -1218,7 +1195,7 @@ async fn create_user_json_map(mut ck: CK, server2: &ServerArc) -> Result<Respons
             ck.id = Some(uuid);
             Ok(warp::reply::json(&ck).into_response())
         }
-        Err(_) => Ok(ApiError::InternalError("Failed to create user".to_string()).into()),
+        Err(_) => Ok(ApiError::InternalError("Failed to create user".to_string()).to_response(true)),
     }
 }
 
@@ -1240,7 +1217,7 @@ async fn send_all_json_map(uui: String, server2: &ServerArc) -> Result<Response,
     let id = uuid::Uuid::parse_str(&uui);
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
-        return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).into());
+        return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true));
     }
     let server = server2.read().await;
     match server.send_all(id.clone().unwrap()).await {
@@ -1259,7 +1236,7 @@ async fn send_all_json_map(uui: String, server2: &ServerArc) -> Result<Response,
                 Err(_) => Ok(warp::reply::json(&passwords).into_response()),
             }
         }
-        Err(_) => Ok(ApiError::InternalError("Failed to send pass".to_string()).into()),
+        Err(_) => Ok(ApiError::InternalError("Failed to send pass".to_string()).to_response(true)),
     }
 }
 
@@ -1327,14 +1304,14 @@ async fn share_pass_json_map(
     let owner_id = match uuid::Uuid::parse_str(&owner) {
         Ok(uuid) => uuid,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for owner ID".to_string()).into())
+            return Ok(ApiError::BadRequest("Invalid UUID format for owner ID".to_string()).to_response(true))
         }
     };
 
     let pass_uuid = match uuid::Uuid::parse_str(&pass_id) {
         Ok(uuid) => uuid,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).into())
+            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true))
         }
     };
 
@@ -1342,7 +1319,7 @@ async fn share_pass_json_map(
         Ok(uuid) => uuid,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for recipient ID".to_string()).into(),
+                ApiError::BadRequest("Invalid UUID format for recipient ID".to_string()).to_response(true)
             )
         }
     };
@@ -1408,14 +1385,14 @@ async fn unshare_pass_json_map(
     let owner_id = match uuid::Uuid::parse_str(&owner) {
         Ok(uuid) => uuid,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for owner ID".to_string()).into())
+            return Ok(ApiError::BadRequest("Invalid UUID format for owner ID".to_string()).to_response(true))
         }
     };
 
     let pass_uuid = match uuid::Uuid::parse_str(&pass_id) {
         Ok(uuid) => uuid,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).into())
+            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true))
         }
     };
 
@@ -1423,7 +1400,7 @@ async fn unshare_pass_json_map(
         Ok(uuid) => uuid,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for recipient ID".to_string()).into(),
+                ApiError::BadRequest("Invalid UUID format for recipient ID".to_string()).to_response(true)
             )
         }
     };
@@ -1488,7 +1465,7 @@ async fn get_shared_pass_json_map(
         Ok(uuid) => uuid,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for recipient ID".to_string()).into(),
+                ApiError::BadRequest("Invalid UUID format for recipient ID".to_string()).to_response(true)
             )
         }
     };
@@ -1496,14 +1473,14 @@ async fn get_shared_pass_json_map(
     let owner_id = match uuid::Uuid::parse_str(&owner) {
         Ok(uuid) => uuid,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for owner ID".to_string()).into())
+            return Ok(ApiError::BadRequest("Invalid UUID format for owner ID".to_string()).to_response(true))
         }
     };
 
     let pass_uuid = match uuid::Uuid::parse_str(&pass_id) {
         Ok(uuid) => uuid,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).into())
+            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true))
         }
     };
 

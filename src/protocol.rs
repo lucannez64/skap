@@ -576,9 +576,32 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
         let nonce2 = pass.nonce2.clone().ok_or(ProtocolError::DataError)?;
+        println!("nonce2: {:?}", nonce2.len());
+        println!("ciphertext: {:?}", pass.ciphertext.len());
+        println!("nonce: {:?}", pass.nonce.len());
+        println!("secret: {:?}", secret.len());
+        println!("hash: {:?}", hash);
+
+        let ciphertext = cipher.encrypt(XNonce::from_slice(&nonce2), pass.ciphertext.as_slice())
+            .map_err(|_| ProtocolError::CryptoError)?;
+
+        println!("ciphertext: {:?}", ciphertext);
+        let pass3 = cipher.decrypt(XNonce::from_slice(&nonce2), ciphertext.as_slice())
+            .map_err(|_| ProtocolError::CryptoError)?;
+
+        // compare pass3 with pass.ciphertext
+        if pass3 != pass.ciphertext {
+            println!("pass3: {:?}", pass3.len());
+            println!("pass.ciphertext: {:?}", pass.ciphertext.len());
+            return Err(ProtocolError::CryptoError);
+        }
+
         let pass2 = cipher
             .decrypt(XNonce::from_slice(&nonce2), pass.ciphertext.as_slice())
-            .map_err(|_| ProtocolError::CryptoError)?;
+            .map_err(|e| {
+                println!("Error decrypting pass: {}", e.to_string());
+                ProtocolError::CryptoError
+            })?;
         let ep = EP {
             ciphertext: pass2,
             nonce: pass.nonce,
@@ -664,7 +687,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
 pub struct EP {
     pub ciphertext: Vec<u8>,
     pub nonce: Vec<u8>,
-    nonce2: Option<Vec<u8>>,
+    pub nonce2: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
