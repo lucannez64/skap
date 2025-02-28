@@ -1,0 +1,53 @@
+# Fichiers et dossiers Git
+.git
+.gitignore
+
+# Fichiers de build Rust
+/target
+
+# Fichiers de configuration d'éditeur
+.vscode
+.idea
+*.swp
+*.swo
+
+# Fichiers de logs
+*.log
+
+# Fichiers de dépendances Node.js (pour le frontend)
+node_modules
+npm-debug.log
+
+# Fichiers de build du frontend
+/dist
+/build
+
+# Fichiers d'environnement
+.env
+.env.*
+!.env.example
+
+# Fichiers Docker
+docker-compose*.yml
+Dockerfile*
+.dockerignore
+
+# Documentation
+README*.md
+CHANGELOG.md
+LICENSE
+
+# Fichiers de cache
+.zig-cache
+.cargo-cache
+
+# Fichiers de test
+**/*_test.*
+**/test_*.*
+
+# Autres fichiers
+*.pem
+!ca.pem
+*.bak
+*.tmp
+*.old 

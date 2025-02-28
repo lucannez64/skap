@@ -1,7 +1,7 @@
 use base64::Engine;
 use blake3::hash;
-use rand::{rngs::StdRng, RngCore, SeedableRng, TryRngCore };
 use thiserror::Error;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[cfg(feature = "server")]
 use crate::postgres::PassesPostgres;
@@ -12,8 +12,8 @@ use crate::postgres::SharedPassesPostgres;
 
 use bytes::BytesMut;
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
-    Key, XChaCha20Poly1305, XNonce,
+    aead::{Aead, AeadCore, KeyInit, OsRng, rand_core::RngCore},
+    Key, XChaCha20Poly1305, XNonce, 
 };
 use libcrux_ml_kem::mlkem1024::{
     self, MlKem1024Ciphertext, MlKem1024PrivateKey, MlKem1024PublicKey,
@@ -65,6 +65,7 @@ pub struct KyPublicKey {
 
 pub type KySecretKey = [u8; KYBER_SECRETKEYBYTES];
 
+
 #[cfg(feature = "server")]
 impl<'a> FromSql<'a> for KyPublicKey {
     fn from_sql(
@@ -90,9 +91,8 @@ impl From<KyPublicKey> for MlKem1024PublicKey {
 }
 
 fn random_array<const L: usize>() -> [u8; L] {
-    let mut rng = StdRng::from_os_rng();
     let mut seed = [0; L];
-    rng.try_fill_bytes(&mut seed).unwrap();
+    OsRng.fill_bytes(&mut seed);
     seed
 }
 
@@ -124,6 +124,14 @@ pub struct DiSecretKey {
     #[serde_as(as = "Bytes")]
     pub bytes: [u8; ml_dsa_87::SK_LEN],
 }
+
+impl Zeroize for DiSecretKey {
+    fn zeroize(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for DiSecretKey {}
 
 #[cfg(feature = "server")]
 impl<'a> FromSql<'a> for DiPublicKey {
@@ -224,7 +232,7 @@ impl SharedPasses {
 
 pub struct Server<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> {
     users: E,
-    rng: StdRng,
+    rng: OsRng,
     challenges: D,
     secrets: T,
     passes: U,
@@ -421,7 +429,7 @@ impl SecretsT for Secrets {
 
 impl Server<Secrets, Passes, Challenges, Users, SharedPasses> {
     pub fn new() -> ResultP<Self> {
-        let rng = StdRng::from_os_rng();
+        let rng = OsRng;
         Ok(Server {
             users: Users::new(),
             rng,
@@ -435,7 +443,7 @@ impl Server<Secrets, Passes, Challenges, Users, SharedPasses> {
 #[cfg(feature = "server")]
 impl Server<Secrets, PassesPostgres, Challenges, UsersPostgres, SharedPassesPostgres> {
     pub async fn new(postgres_url: &str, file: &str) -> ResultP<Self> {
-        let rng = StdRng::from_os_rng();
+        let rng = OsRng;
         let passes = PassesPostgres::new(postgres_url, file)
             .await
             .map_err(|_| ProtocolError::StorageError)?;
@@ -483,20 +491,21 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
 
     pub async fn challenge(&mut self, id: Uuid) -> ResultP<[u8; 32]> {
         let mut challenge = [0u8; 32];
-        self.rng.try_fill_bytes(&mut challenge).unwrap();
+        self.rng.try_fill_bytes(&mut challenge)
+            .map_err(|_| ProtocolError::CryptoError)?;
         let _ = self.get_user(id).await?;
         self.challenges.add_challenge(id, challenge);
         Ok(challenge)
     }
 
     pub async fn verify(&self, id: Uuid, signature: &[u8]) -> ResultP<()> {
-
         if signature.len() !=  ml_dsa_87::SIG_LEN {
             return Err(ProtocolError::AuthError);
         }
         let ck = self.get_user(id).await?;
         let challenge = self.challenges.get_challenge(id)?;
-        let signature2 : [u8; ml_dsa_87::SIG_LEN] = signature.try_into().unwrap();
+        let signature2 : [u8; ml_dsa_87::SIG_LEN] = signature.try_into()
+            .map_err(|_| ProtocolError::AuthError)?;
         let verify = ck.di_p.to_di().verify(&challenge, &signature2, &[]);
         if verify {
             Ok(())
@@ -668,6 +677,27 @@ pub struct Password {
     pub otp: Option<String>,
 }
 
+impl Zeroize for Password {
+    fn zeroize(&mut self) {
+        self.password.zeroize();
+        if let Some(ref mut app_id) = self.app_id {
+            app_id.zeroize();
+        }
+        self.username.zeroize();
+        if let Some(ref mut description) = self.description {
+            description.zeroize();
+        }
+        if let Some(ref mut url) = self.url {
+            url.zeroize();
+        }
+        if let Some(ref mut otp) = self.otp {
+            otp.zeroize();
+        }
+    }
+}
+
+impl ZeroizeOnDrop for Password {}
+
 #[serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Client {
@@ -678,6 +708,18 @@ pub struct Client {
     pub di_q: DiSecretKey,
     pub secret: Option<[u8; KYBER_SSBYTES]>,
 }
+
+impl Zeroize for Client {
+    fn zeroize(&mut self) {
+        self.ky_q.zeroize();
+        self.di_q.zeroize();
+        if let Some(ref mut secret) = self.secret {
+            secret.zeroize();
+        }
+    }
+}
+
+impl ZeroizeOnDrop for Client {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientEx {
@@ -808,8 +850,9 @@ impl Client {
         Ok(pass)
     }
 
-    pub fn sign(&self, challenge: &[u8]) -> [u8; ml_dsa_87::SIG_LEN] {
-        self.di_q.clone().to_di().try_sign(challenge, &[]).unwrap()
+    pub fn sign(&self, challenge: &[u8]) -> ResultP<[u8; ml_dsa_87::SIG_LEN]> {
+        self.di_q.clone().to_di().try_sign(challenge, &[])
+            .map_err(|_| ProtocolError::CryptoError)
     }
 
     pub fn sync(&mut self, ciphertextsync: &[u8]) -> ResultP<()> {
@@ -817,7 +860,8 @@ impl Client {
         if ciphertextsync.len() != 1568 {
             return Err(ProtocolError::DataError);
         }
-        let ci: &[u8; 1568] = ciphertextsync.try_into().unwrap();
+        let ci: &[u8; 1568] = ciphertextsync.try_into()
+            .map_err(|_| ProtocolError::DataError)?;
         let cipher = MlKem1024Ciphertext::from(ci);
         let s = mlkem1024::decapsulate(&sk, &cipher);
         self.secret = Some(s);
@@ -961,7 +1005,7 @@ impl Shards {
 #[cfg(feature = "server")]
 impl Server<RedisSecrets, PassesPostgres, RedisChallenges, UsersPostgres, SharedPassesPostgres> {
     pub async fn new_with_redis(postgres_url: &str, redis_url: &str, file: &str) -> ResultP<Self> {
-        let rng = StdRng::from_os_rng();
+        let rng = OsRng;
         let passes = PassesPostgres::new(postgres_url, file)
             .await
             .map_err(|_| ProtocolError::StorageError)?;

@@ -3470,6 +3470,7 @@ dependencies = [
  "url",
  "uuid",
  "warp",
+ "zeroize",
 ]
 
 [[package]]

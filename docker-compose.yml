@@ -1,0 +1,90 @@
+services:
+  # Service pour générer le certificat CA si nécessaire
+  ca-generator:
+    image: alpine:latest
+    command: >
+      sh -c "
+        if [ ! -f /certs/ca.pem ]; then
+          echo 'Génération du certificat CA...'
+          apk add --no-cache openssl
+          openssl req -x509 -newkey rsa:4096 -keyout /certs/ca.key -out /certs/ca.pem -days 3650 -nodes -subj '/CN=skap-postgres/O=Skap/C=FR' -addext 'subjectAltName=DNS:postgres,DNS:localhost,IP:127.0.0.1'
+          echo 'Certificat CA généré avec succès.'
+        else
+          echo 'Le certificat CA existe déjà.'
+        fi
+      "
+    volumes:
+      - ca-cert:/certs:rw
+    networks:
+      - skap-network
+
+  # Service PostgreSQL
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=skap
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+      - ca-cert:/var/lib/postgresql/certs:ro
+    restart: unless-stopped
+    networks:
+      - skap-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      - ca-generator
+
+  # Service Redis
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - skap-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  
+  # Service pour le serveur Rust
+  skap-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3030:3030"
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/skap
+      - REDIS_URL=redis://redis:6379
+      - CA_FILE=/app/ca.pem
+      - BASE64_KEY=Cnq094AgzRxApmXC5vjCMzVncq42Ihm6fS7diRYhKqQ=
+      - SERVER_ADDR=0.0.0.0:3030
+    volumes:
+      - ca-cert:/app:rw
+    restart: unless-stopped
+    networks:
+      - skap-network
+
+volumes:
+  postgres-data:
+  redis-data:
+  ca-cert:
+
+networks:
+  skap-network:
+    driver: bridge 

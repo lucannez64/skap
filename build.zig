@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
     // Cible pour construire le serveur
     const server_step = b.step("server", "Build server version");
     const server_cmd = b.addSystemCommand(&[_][]const u8{
-        "cargo", "+nightly", "build", "-Zbuild-std", "--release", 
+        "cargo", "+nightly",    "build",      "-Zbuild-std", "--release",
         "--bin", "skap-server", "--features", "server",
     });
     server_cmd.setEnvironmentVariable("RUSTFLAGS", rust_flags);
@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
     // Cible pour construire le TUI
     const tui_step = b.step("tui", "Build TUI version");
     const tui_cmd = b.addSystemCommand(&[_][]const u8{
-        "cargo", "+nightly", "build", "-Zbuild-std", "--release", 
+        "cargo", "+nightly", "build",      "-Zbuild-std", "--release",
         "--bin", "skap-tui", "--features", "tui",
     });
     tui_cmd.setEnvironmentVariable("RUSTFLAGS", rust_flags);
@@ -68,6 +68,34 @@ pub fn build(b: *std.Build) void {
     });
     clean_step.dependOn(&clean_cmd.step);
 
+    // Cible pour construire l'image Docker
+    const docker_build_step = b.step("docker-build", "Build Docker image");
+    const docker_build_cmd = b.addSystemCommand(&[_][]const u8{
+        "docker-compose", "build",
+    });
+    docker_build_step.dependOn(&docker_build_cmd.step);
+
+    // Cible pour exécuter les services Docker
+    const docker_run_step = b.step("docker-run", "Run Docker services");
+    const docker_run_cmd = b.addSystemCommand(&[_][]const u8{
+        "docker-compose", "up", "-d",
+    });
+    docker_run_step.dependOn(&docker_run_cmd.step);
+
+    // Cible pour arrêter les services Docker
+    const docker_stop_step = b.step("docker-stop", "Stop Docker services");
+    const docker_stop_cmd = b.addSystemCommand(&[_][]const u8{
+        "docker-compose", "down",
+    });
+    docker_stop_step.dependOn(&docker_stop_cmd.step);
+
+    // Cible pour afficher les logs des services Docker
+    const docker_logs_step = b.step("docker-logs", "Show Docker logs");
+    const docker_logs_cmd = b.addSystemCommand(&[_][]const u8{
+        "docker-compose", "logs", "-f",
+    });
+    docker_logs_step.dependOn(&docker_logs_cmd.step);
+
     // Définir la cible par défaut
     b.default_step.dependOn(release_step);
-} 
+}
