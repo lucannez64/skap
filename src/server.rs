@@ -27,6 +27,12 @@ struct ErrorMessage {
     message: String,
 }
 
+#[derive(Clone, Debug,Serialize, Deserialize)]
+struct PasswordsExtended {
+    passwords: Vec<(EP, Uuid)>,
+    shared_passes: Vec<(SharedPass, Uuid, Uuid)>,
+}
+
 #[derive(Debug, Serialize)]
 enum ApiError {
     BadRequest(String),
@@ -1237,16 +1243,13 @@ async fn send_all_json_map(uui: String, server2: &ServerArc) -> Result<Response,
         return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).into());
     }
     let server = server2.read().await;
-    match server.send_all(id.unwrap()).await {
+    match server.send_all(id.clone().unwrap()).await {
         Ok(r) => {
             let passwords = r;
             match server.get_all_shared_passes(id.unwrap()).await {
                 Ok(shared_passes) => {
                     let pp = shared_passes;
-                    struct PasswordsExtended {
-                        passwords: Vec<(EP, Uuid)>,
-                        shared_passes: Vec<(SharedPass, Uuid, Uuid)>,
-                    }
+
                     let passwords_extended = PasswordsExtended {
                         passwords,
                         shared_passes: pp,

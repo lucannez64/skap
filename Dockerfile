@@ -17,7 +17,9 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 
 # Installer les dépendances nécessaires
-RUN apt-get update && \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
     apt-get install -y pkg-config libssl-dev && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
