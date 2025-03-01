@@ -37,10 +37,10 @@ use uuid::Uuid;
 use fips204::ml_dsa_87;
 use fips204::traits::{SerDes, Signer, Verifier};
 
-const KYBER_PUBLICKEYBYTES: usize = 1568;
-const KYBER_CIPHERTEXTBYTES: usize = 1568;
-const KYBER_SSBYTES: usize = 32;
-const KYBER_SECRETKEYBYTES: usize = 3168;
+pub const KYBER_PUBLICKEYBYTES: usize = 1568;
+pub const KYBER_CIPHERTEXTBYTES: usize = 1568;
+pub const KYBER_SSBYTES: usize = 32;
+pub const KYBER_SECRETKEYBYTES: usize = 3168;
 
 #[derive(Error, Debug)]
 pub enum ProtocolError {
@@ -64,6 +64,13 @@ pub struct KyPublicKey {
 }
 
 pub type KySecretKey = [u8; KYBER_SECRETKEYBYTES];
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SharedByUser {
+    pub pass_id: Uuid,
+    pub recipient_ids: Vec<Uuid>,
+}
+
 
 
 #[cfg(feature = "server")]
@@ -251,6 +258,10 @@ pub trait UsersT {
     async fn get_user(&self, id: Uuid) -> ResultP<CK>;
     async fn add_user(&mut self, id: Uuid, user: CK) -> ResultP<()>;
     async fn remove_user(&mut self, id: Uuid) -> ResultP<()>;
+    async fn get_user_from_email(&self, email: String) -> ResultP<CK>;
+    async fn get_uuids_from_emails(&self, emails: Vec<String>) -> ResultP<Vec<Uuid>>;
+    async fn get_public_key(&self, id: Uuid) -> ResultP<[u8; KYBER_PUBLICKEYBYTES]>;
+    async fn get_emails_from_uuids(&self, uuids: Vec<Uuid>) -> ResultP<Vec<String>>;
 }
 
 impl Users {
@@ -273,6 +284,25 @@ impl UsersT for Users {
             .remove(&id)
             .ok_or(ProtocolError::StorageError)
             .map(|_| ())
+    }
+
+    async fn get_user_from_email(&self, email: String) -> ResultP<CK> {
+        self.0.values().find(|user| user.email == email).cloned().ok_or(ProtocolError::StorageError)
+    }
+
+    async fn get_public_key(&self, id: Uuid) -> ResultP<[u8; KYBER_PUBLICKEYBYTES]> {
+        let user = self.get_user(id).await?;
+        Ok(user.ky_p.bytes)
+    }
+
+    async fn get_uuids_from_emails(&self, emails: Vec<String>) -> ResultP<Vec<Uuid>> {
+        let uuids = self.0.values().filter(|user| emails.contains(&user.email)).map(|user| user.id.unwrap()).collect();
+        Ok(uuids)
+    }
+
+    async fn get_emails_from_uuids(&self, uuids: Vec<Uuid>) -> ResultP<Vec<String>> {
+        let emails = self.0.values().filter(|user| uuids.contains(&user.id.unwrap())).map(|user| user.email.clone()).collect();
+        Ok(emails)
     }
 }
 
@@ -332,6 +362,11 @@ pub trait SharedPassesT {
         &self,
         recipient: Uuid,
     ) -> ResultP<Vec<(Vec<u8>, Uuid, Uuid)>>;
+
+    async fn get_shared_by_user(
+        &self,
+        owner: Uuid
+    ) -> ResultP<Vec<SharedByUser>>;
 }
 
 
@@ -374,6 +409,23 @@ impl SharedPassesT for SharedPasses {
         for ((owner, pass_id, rec), shared_pass) in &self.0 {
             if *rec == recipient {
                 shared_passes.push((shared_pass.clone(), *owner, *pass_id));
+            }
+        }
+        Ok(shared_passes)
+    }
+
+    async fn get_shared_by_user(
+        &self,
+        ownerr: Uuid
+    ) -> ResultP<Vec<SharedByUser>> {
+        let mut shared_passes: Vec<SharedByUser> = Vec::new();
+        for ((owner, pass_id, rec), _) in &self.0 {
+            if *owner == ownerr {
+                if !shared_passes.iter().any(|s| s.pass_id == *pass_id) {
+                    shared_passes.push(SharedByUser { pass_id: *pass_id, recipient_ids: vec![*rec] });
+                } else {
+                    shared_passes.iter_mut().find(|s| s.pass_id == *pass_id).unwrap().recipient_ids.push(*rec);
+                }
             }
         }
         Ok(shared_passes)
@@ -470,6 +522,27 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         let id = ck.id.unwrap();
         self.users.add_user(id.clone(), ck.clone()).await?;
         Ok(id)
+    }
+
+    pub async fn get_uuid_from_email(&self, email: String) -> ResultP<Uuid> {
+        let user = self.users.get_user_from_email(email).await?;
+        if let Some(id) = user.id {
+            Ok(id)
+        } else {
+            Err(ProtocolError::StorageError)
+        }
+    }
+
+    pub async fn get_emails_from_uuids(&self, uuids: Vec<Uuid>) -> ResultP<Vec<String>> {
+        self.users.get_emails_from_uuids(uuids).await
+    }
+
+    pub async fn get_uuids_from_emails(&self, emails: Vec<String>) -> ResultP<Vec<Uuid>> {
+        self.users.get_uuids_from_emails(emails).await
+    }
+
+    pub async fn get_public_key(&self, id: Uuid) -> ResultP<[u8; KYBER_PUBLICKEYBYTES]> {
+        self.users.get_public_key(id).await
     }
 
     pub async fn get_all_shared_passes(&self, recipient: Uuid) -> ResultP<Vec<(SharedPass, Uuid, Uuid)>> {
@@ -576,25 +649,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
         let nonce2 = pass.nonce2.clone().ok_or(ProtocolError::DataError)?;
-        println!("nonce2: {:?}", nonce2.len());
-        println!("ciphertext: {:?}", pass.ciphertext.len());
-        println!("nonce: {:?}", pass.nonce.len());
-        println!("secret: {:?}", secret.len());
-        println!("hash: {:?}", hash);
 
-        let ciphertext = cipher.encrypt(XNonce::from_slice(&nonce2), pass.ciphertext.as_slice())
-            .map_err(|_| ProtocolError::CryptoError)?;
-
-        println!("ciphertext: {:?}", ciphertext);
-        let pass3 = cipher.decrypt(XNonce::from_slice(&nonce2), ciphertext.as_slice())
-            .map_err(|_| ProtocolError::CryptoError)?;
-
-        // compare pass3 with pass.ciphertext
-        if pass3 != pass.ciphertext {
-            println!("pass3: {:?}", pass3.len());
-            println!("pass.ciphertext: {:?}", pass.ciphertext.len());
-            return Err(ProtocolError::CryptoError);
-        }
 
         let pass2 = cipher
             .decrypt(XNonce::from_slice(&nonce2), pass.ciphertext.as_slice())
@@ -680,6 +735,14 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
             .await?;
         bincode::deserialize(&shared_data)
             .map_err(|_| ProtocolError::DataError)
+    }
+
+    pub async fn get_shared_by_user(
+        &self,
+        owner: Uuid
+    ) -> ResultP<Vec<SharedByUser>> {
+        let shared_by_user: Vec<SharedByUser> = self.shared_passes.get_shared_by_user(owner).await?;
+        Ok(shared_by_user)
     }
 }
 

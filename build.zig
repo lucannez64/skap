@@ -78,7 +78,7 @@ pub fn build(b: *std.Build) void {
     // Cible pour construire l'image Docker
     const docker_build_step = b.step("docker-build", "Build Docker image");
     const docker_build_cmd = b.addSystemCommand(&[_][]const u8{
-        "docker-compose", "build",
+        "docker", "compose", "build",
     });
     docker_build_cmd.setEnvironmentVariable("DOCKER_BUILDKIT", "1");
     docker_build_cmd.setEnvironmentVariable("COMPOSE_DOCKER_CLI_BUILD", "1");
@@ -87,21 +87,21 @@ pub fn build(b: *std.Build) void {
     // Cible pour exécuter les services Docker
     const docker_run_step = b.step("docker-run", "Run Docker services");
     const docker_run_cmd = b.addSystemCommand(&[_][]const u8{
-        "docker-compose", "up", "-d",
+        "docker", "compose", "up", "-d",
     });
     docker_run_step.dependOn(&docker_run_cmd.step);
 
     // Cible pour arrêter les services Docker
     const docker_stop_step = b.step("docker-stop", "Stop Docker services");
     const docker_stop_cmd = b.addSystemCommand(&[_][]const u8{
-        "docker-compose", "down",
+        "docker", "compose", "down",
     });
     docker_stop_step.dependOn(&docker_stop_cmd.step);
 
     // Cible pour afficher les logs des services Docker
     const docker_logs_step = b.step("docker-logs", "Show Docker logs");
     const docker_logs_cmd = b.addSystemCommand(&[_][]const u8{
-        "docker-compose", "logs", "-f",
+        "docker", "compose", "logs", "-f",
     });
     docker_logs_step.dependOn(&docker_logs_cmd.step);
 

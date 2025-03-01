@@ -1,6 +1,6 @@
 use std::{fs::File, str::FromStr};
 
-use crate::protocol::{PassesT, ProtocolError, ResultP, UsersT, SharedPassesT};
+use crate::protocol::{PassesT, ProtocolError, ResultP, UsersT, SharedPassesT, SharedByUser};
 use tokio_postgres::Error;
 use deadpool_postgres::{tokio_postgres, GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod};
 use tokio_postgres_tls::MakeRustlsConnect;
@@ -114,6 +114,72 @@ impl UsersT for UsersPostgres {
                 ProtocolError::StorageError
             })?;
         Ok(())
+    }
+
+    async fn get_user_from_email(&self, email: String) -> ResultP<crate::protocol::CK> {
+        let database = self.database.get().await?;
+        let stmt = database.prepare_cached("SELECT id, email, ky_public_key, di_public_key FROM users WHERE email = $1").await.map_err(|e| {
+            eprintln!("Error getting user from email: {}", e);
+            ProtocolError::StorageError
+        })?;
+        let row = database
+            .query_one(&stmt, &[&email])
+            .await
+            .map_err(|e| {
+                eprintln!("Error getting user from email: {}", e);
+                ProtocolError::StorageError
+            })?;    
+        let a = crate::protocol::CK {
+            email: row.get(1),
+            ky_p: row.get(2),
+            di_p: row.get(3),
+            id: Some(row.get(0)),
+        };
+        Ok(a)
+    }
+
+    async fn get_uuids_from_emails(&self, emails: Vec<String>) -> ResultP<Vec<Uuid>> {
+        let database = self.database.get().await?;
+        let stmt = database.prepare_cached("SELECT id FROM users WHERE email = ANY($1)").await.map_err(|e| {
+            eprintln!("Error getting uuids from emails: {}", e);
+            ProtocolError::StorageError
+        })?;
+        let rows = database.query(&stmt, &[&emails]).await.map_err(|e| {
+            eprintln!("Error getting uuids from emails: {}", e);
+            ProtocolError::StorageError
+        })?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    async fn get_emails_from_uuids(&self, uuids: Vec<Uuid>) -> ResultP<Vec<String>> {
+        let database = self.database.get().await?;
+        let stmt = database.prepare_cached("SELECT email FROM users WHERE id = ANY($1)").await.map_err(|e| {
+            eprintln!("Error getting emails from uuids: {}", e);
+            ProtocolError::StorageError
+        })?;
+        let rows = database.query(&stmt, &[&uuids]).await.map_err(|e| {
+            eprintln!("Error getting emails from uuids: {}", e);
+            ProtocolError::StorageError
+        })?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+    async fn get_public_key(&self, id: Uuid) -> ResultP<[u8; crate::protocol::KYBER_PUBLICKEYBYTES]> {
+        let database = self.database.get().await?;
+        let stmt = database.prepare_cached("SELECT ky_public_key FROM users WHERE id = $1").await.map_err(|e| {
+            eprintln!("Error getting public key: {}", e);
+            ProtocolError::StorageError
+        })?;
+        let row = database
+            .query_one(&stmt, &[&id])
+            .await
+            .map_err(|e| {
+                eprintln!("Error getting public key: {}", e);
+                ProtocolError::StorageError
+            })?;
+        let a: Vec<u8> = row.get(0);
+        let mut b = [0u8; crate::protocol::KYBER_PUBLICKEYBYTES];
+        b.copy_from_slice(&a);
+        Ok(b)
     }
 }
 
@@ -354,6 +420,34 @@ impl SharedPassesT for SharedPassesPostgres {
             result.push((data, pass_id, owner_id));
         }
 
+        Ok(result)
+    }
+
+    async fn get_shared_by_user(
+        &self,
+        owner: Uuid
+    ) -> ResultP<Vec<SharedByUser>> {
+        let database = self.database.get().await?;
+        let stmt = database.prepare_cached("SELECT pass_id, recipient_id FROM shared_passes WHERE owner_id = $1").await.map_err(|e| {
+            eprintln!("Error preparing statement: {}", e);
+            ProtocolError::StorageError
+        })?;
+        
+        let rows = database.query(&stmt, &[&owner]).await.map_err(|e| {
+            eprintln!("Error getting shared by user: {}", e);
+            ProtocolError::StorageError
+        })?;
+
+        let mut result: Vec<SharedByUser> = Vec::new();
+        for row in rows {
+            let pass_id: Uuid = row.get(0);
+            let recipient_id: Uuid = row.get(1);
+            if !result.iter().any(|s| s.pass_id == pass_id) {
+                result.push(SharedByUser { pass_id, recipient_ids: vec![recipient_id] });
+            } else {
+                result.iter_mut().find(|s| s.pass_id == pass_id).unwrap().recipient_ids.push(recipient_id);
+            }
+        }
         Ok(result)
     }
 }

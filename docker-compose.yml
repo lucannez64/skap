@@ -58,28 +58,6 @@ services:
       timeout: 5s
       retries: 5
   
-  # Service pour le serveur Rust
-  skap-server:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    ports:
-      - "3030:3030"
-    depends_on:
-      - postgres
-      - redis
-    environment:
-      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/skap
-      - REDIS_URL=redis://redis:6379
-      - CA_FILE=/app/ca.pem
-      - BASE64_KEY=Cnq094AgzRxApmXC5vjCMzVncq42Ihm6fS7diRYhKqQ=
-      - SERVER_ADDR=0.0.0.0:3030
-    volumes:
-      - ca-cert:/app:rw
-    restart: unless-stopped
-    networks:
-      - skap-network
-
 volumes:
   postgres-data:
   redis-data:

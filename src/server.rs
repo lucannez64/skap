@@ -2,6 +2,7 @@ use crate::postgres::PassesPostgres;
 use crate::postgres::SharedPassesPostgres;
 use crate::postgres::UsersPostgres;
 use crate::protocol::SharedPass;
+use crate::protocol::SharedByUser;
 use uuid::Uuid;
 use crate::protocol::Server as Server2;
 use crate::protocol::CK;
@@ -20,6 +21,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use warp::{reject, reply::Response, Filter, Rejection, Reply};
+
 
 #[derive(Serialize)]
 struct ErrorMessage {
@@ -677,6 +679,64 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             },
         );
 
+    let get_uuid_from_email = warp::get()
+        .and(warp::path("get_uuid_from_email"))
+        .and(warp::path::param::<String>())
+        .and(server_filter.clone())
+        .and_then(
+            |email: String, server2: ServerArc| async move {
+                get_uuid_from_email_map(email, &server2).await
+            },
+        );
+
+    let get_public_key = warp::get()
+        .and(warp::path("get_public_key"))
+        .and(warp::path::param::<String>())
+        .and(server_filter.clone())
+        .and_then(
+            |id: String, server2: ServerArc| async move {
+                let id = match uuid::Uuid::parse_str(&id) {
+                    Ok(uuid) => uuid,
+                    Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+                };
+                get_public_key_map(id, &server2).await
+            },
+        );
+
+    let get_shared_by_user = warp::get()
+        .and(warp::path("get_shared_by_user"))
+        .and(warp::path::param::<String>())
+        .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and_then(
+            |owner: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: String| async move {
+                if let Err(response) = auth_validation(sk, &owner, token, false).await {
+                    return Ok(response);
+                }
+                get_shared_by_user_map(owner, &server2).await
+            },
+        );
+
+    let get_uuids_from_emails = warp::post()
+        .and(warp::path("get_uuids_from_emails"))
+        .and(warp::body::json())
+        .and(server_filter.clone())
+        .and_then(
+            |emails: Vec<String>, server2: ServerArc| async move {
+                get_uuids_from_emails_map(emails, &server2).await
+            },
+        );
+
+    let get_emails_from_uuids = warp::post()
+        .and(warp::path("get_emails_from_uuids"))
+        .and(warp::body::json())
+        .and(server_filter.clone())
+        .and_then(
+            |uuids: Vec<Uuid>, server2: ServerArc| async move {
+                get_emails_from_uuids_map(uuids, &server2).await
+            },
+        );
     let home = warp::get().and(warp::path::end()).and_then(|| async move {
         Ok::<warp::reply::Response, Infallible>(warp::reply::Response::new("Hello, world!".into()))
     });
@@ -705,6 +765,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .or(unshare_pass_json)
         .or(get_shared_pass)
         .or(get_shared_pass_json)
+        .or(get_uuid_from_email)
+        .or(get_public_key)
+        .or(get_shared_by_user)
+        .or(get_uuids_from_emails)
+        .or(get_emails_from_uuids)
         .or(home);
 
     // Ajout de logs pour les routes
@@ -733,6 +798,62 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Server shutdown");
     Ok(())
 }
+
+async fn get_uuid_from_email_map(email: String, server2: &ServerArc) -> Result<Response, Infallible> {
+    let server = server2.read().await;
+    let uuid = server.get_uuid_from_email(email).await;
+    if let Ok(uuid) = uuid {
+        Ok(warp::reply::Response::new(uuid.to_string().into()))
+    } else {
+        Ok(ApiError::BadRequest("Failed to get UUID from email".to_string()).to_response(false))
+    }
+}
+
+async fn get_uuids_from_emails_map(emails: Vec<String>, server2: &ServerArc) -> Result<Response, Infallible> {
+    let server = server2.read().await;
+    let uuids = server.get_uuids_from_emails(emails).await;
+    if let Ok(uuids) = uuids {
+        Ok(warp::reply::json(&uuids).into_response())
+    } else {
+        Ok(ApiError::BadRequest("Failed to get UUIDs from emails".to_string()).to_response(false))
+    }
+
+}
+
+async fn get_emails_from_uuids_map(uuids: Vec<Uuid>, server2: &ServerArc) -> Result<Response, Infallible> {
+    let server = server2.read().await;
+    let emails = server.get_emails_from_uuids(uuids).await;
+    if let Ok(emails) = emails {
+        Ok(warp::reply::json(&emails).into_response())
+    } else {
+        Ok(ApiError::BadRequest("Failed to get emails from UUIDs".to_string()).to_response(false))
+    }
+}
+
+async fn get_public_key_map(id: Uuid, server2: &ServerArc) -> Result<Response, Infallible> {
+    let server = server2.read().await;
+    let public_key = server.get_public_key(id).await;
+    if let Ok(public_key) = public_key {
+        Ok(warp::reply::json(&public_key.to_vec()).into_response())
+    } else {
+        Ok(ApiError::BadRequest("Failed to get public key".to_string()).to_response(false))
+    }
+}
+
+async fn get_shared_by_user_map(owner: String, server2: &ServerArc) -> Result<Response, Infallible> {
+    let server = server2.read().await;
+    let owner = match uuid::Uuid::parse_str(&owner) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+    };
+    let shared_by_user = server.get_shared_by_user(owner).await;
+    if let Ok(shared_by_user) = shared_by_user {
+        Ok(warp::reply::json(&shared_by_user).into_response())
+    } else {
+        Ok(ApiError::BadRequest("Failed to get shared by user".to_string()).to_response(false))
+    }
+}
+
 
 async fn delete_map(
     uui: String,
@@ -1214,7 +1335,6 @@ async fn send_all_map(uui: String, server2: &ServerArc) -> Result<Response, Infa
 }
 
 async fn send_all_json_map(uui: String, server2: &ServerArc) -> Result<Response, Infallible> {
-    let id = uuid::Uuid::parse_str(&uui);
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
         return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true));
