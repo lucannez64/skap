@@ -1,8 +1,38 @@
+# Rust
 /target
+**/*.rs.bk
+Cargo.lock
+
+# Environnement et secrets
 .env
-client
-*.txt
+.env.*
+*.pem
+*.key
+*.crt
+*.cert
+*.p12
+*.pfx
+secrets/
+
+# Fichiers de développement
 /.vscode
 /.zig-cache
-ca.key
-ca.pem
+/.idea
+*.log
+*.swp
+*.swo
+
+# Système d'exploitation
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Fichiers temporaires
+*.tmp
+*.bak
+*.backup
+*~
+
+# Fichiers de test
+*.txt
+client

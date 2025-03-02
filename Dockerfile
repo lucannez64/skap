@@ -43,21 +43,25 @@ RUN ls -la /usr/src/skap/target/release/skap-server
 # Deuxième étape pour une image plus légère
 FROM debian:bullseye-slim
 
+# Créer un utilisateur non-root pour exécuter l'application
+RUN groupadd -r skap && useradd -r -g skap skap
+
 WORKDIR /app
 
 # Installer les dépendances d'exécution
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && \
-    apt-get install -y libssl-dev ca-certificates && \
+    apt-get install -y --no-install-recommends libssl-dev ca-certificates && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Copier l'exécutable compilé depuis l'étape de construction
 COPY --from=builder /usr/src/skap/target/release/skap-server /app/skap-server
 
-# Vérifier que l'exécutable a été correctement copié
-RUN ls -la /app/skap-server
+# Définir les permissions appropriées
+RUN chmod 550 /app/skap-server && \
+    chown -R skap:skap /app
 
 # Exposer le port utilisé par le serveur
 EXPOSE 3030
@@ -66,7 +70,10 @@ EXPOSE 3030
 ENV DATABASE_URL="postgres://postgres:postgres@postgres:5432/skap"
 ENV REDIS_URL="redis://redis:6379"
 ENV CA_FILE="/app/ca.pem"
-ENV BASE64_KEY="Cnq094AgzRxApmXC5vjCMzVncq42Ihm6fS7diRYhKqQ="
+# La clé BASE64_KEY doit être fournie lors de l'exécution
+
+# Passer à l'utilisateur non-root
+USER skap:skap
 
 # Commande pour exécuter le serveur
 CMD ["/app/skap-server"]

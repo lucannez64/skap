@@ -1,5 +1,6 @@
 use base64::Engine;
 use blake3::hash;
+use chacha20poly1305::consts::P2;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -29,7 +30,6 @@ use crate::redis::RedisSecrets;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::{serde_as, Bytes};
-use sharks::{Share, Sharks};
 use std::fmt;
 use std::io::Write;
 use std::{collections::HashMap, io::Read};
@@ -55,6 +55,7 @@ pub enum ProtocolError {
 }
 
 pub type ResultP<T> = std::result::Result<T, ProtocolError>;
+
 
 #[serde_as]
 #[derive(Clone, Serialize, Deserialize, Debug, Copy)]
@@ -296,12 +297,34 @@ impl UsersT for Users {
     }
 
     async fn get_uuids_from_emails(&self, emails: Vec<String>) -> ResultP<Vec<Uuid>> {
-        let uuids = self.0.values().filter(|user| emails.contains(&user.email)).map(|user| user.id.unwrap()).collect();
+        let uuids = self.0
+            .values()
+            .filter_map(|user| {
+                if emails.contains(&user.email) {
+                    user.id
+                } else {
+                    None
+                }
+            })
+            .collect();
         Ok(uuids)
     }
 
     async fn get_emails_from_uuids(&self, uuids: Vec<Uuid>) -> ResultP<Vec<String>> {
-        let emails = self.0.values().filter(|user| uuids.contains(&user.id.unwrap())).map(|user| user.email.clone()).collect();
+        let emails = self.0
+            .values()
+            .filter_map(|user| {
+                if let Some(id) = user.id {
+                    if uuids.contains(&id) {
+                        Some(user.email.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
         Ok(emails)
     }
 }
@@ -367,6 +390,12 @@ pub trait SharedPassesT {
         &self,
         owner: Uuid
     ) -> ResultP<Vec<SharedByUser>>;
+
+    async fn get_shared_by_user_and_pass(
+        &self,
+        owner: Uuid,
+        pass_id: Uuid
+    ) -> ResultP<Vec<Uuid>>;
 }
 
 
@@ -418,17 +447,42 @@ impl SharedPassesT for SharedPasses {
         &self,
         ownerr: Uuid
     ) -> ResultP<Vec<SharedByUser>> {
-        let mut shared_passes: Vec<SharedByUser> = Vec::new();
+        // Utiliser une HashMap pour regrouper les destinataires par ID de mot de passe
+        let mut shared_by_pass_id: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        
+        // Collecter tous les destinataires pour chaque mot de passe
         for ((owner, pass_id, rec), _) in &self.0 {
             if *owner == ownerr {
-                if !shared_passes.iter().any(|s| s.pass_id == *pass_id) {
-                    shared_passes.push(SharedByUser { pass_id: *pass_id, recipient_ids: vec![*rec] });
-                } else {
-                    shared_passes.iter_mut().find(|s| s.pass_id == *pass_id).unwrap().recipient_ids.push(*rec);
-                }
+                shared_by_pass_id
+                    .entry(*pass_id)
+                    .or_insert_with(Vec::new)
+                    .push(*rec);
             }
         }
+        
+        // Convertir la HashMap en Vec<SharedByUser>
+        let shared_passes = shared_by_pass_id
+            .into_iter()
+            .map(|(pass_id, recipient_ids)| {
+                SharedByUser { pass_id, recipient_ids }
+            })
+            .collect();
+            
         Ok(shared_passes)
+    }
+
+    async fn get_shared_by_user_and_pass(
+        &self,
+        owner: Uuid,
+        pass_id: Uuid
+    ) -> ResultP<Vec<Uuid>> {
+        let shared_passes = self.get_shared_by_user(owner).await?;
+        let shared_pass = shared_passes.iter().find(|pass| pass.pass_id == pass_id);
+        if let Some(shared_pass) = shared_pass {
+            Ok(shared_pass.recipient_ids.clone())
+        } else {
+            Err(ProtocolError::StorageError)
+        }
     }
 }
 
@@ -520,7 +574,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
     pub async fn add_user(&mut self, ck: &mut CK) -> ResultP<Uuid> {
         ck.set_id();
         let id = ck.id.unwrap();
-        self.users.add_user(id.clone(), ck.clone()).await?;
+        self.users.add_user(id, ck.clone()).await?;
         Ok(id)
     }
 
@@ -622,23 +676,30 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let pass = self.passes.get_all_pass(id).await?;
-        let mut res = Vec::new();
-        for p in pass {
-            let passs: EP = bincode::deserialize(&p.0).unwrap();
-            let ciphertext = cipher
-                .encrypt(&nonce, passs.ciphertext.as_slice())
-                .map_err(|_| ProtocolError::CryptoError)?;
-            res.push((
-                EP {
-                    ciphertext,
-                    nonce: passs.nonce,
-                    nonce2: Some(nonce.to_vec()),
-                },
-                p.1,
-            ));
-        }
-        Ok(res)
+        let passes = self.passes.get_all_pass(id).await?;
+        
+        let results = passes
+            .into_iter()
+            .map(|(pass_data, pass_id)| {
+                let pass: EP = bincode::deserialize(&pass_data).unwrap();
+                let ciphertext = cipher
+                    .encrypt(&nonce, pass.ciphertext.as_slice())
+                    .map_err(|_| ProtocolError::CryptoError);
+                
+                ciphertext.map(|ct| {
+                    (
+                        EP {
+                            ciphertext: ct,
+                            nonce: pass.nonce,
+                            nonce2: Some(nonce.to_vec()),
+                        },
+                        pass_id,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+            
+        Ok(results)
     }
 
     pub async fn create_pass(&mut self, id: Uuid, pass: EP) -> ResultP<Uuid> {
@@ -689,6 +750,11 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
 
     pub async fn delete_pass(&mut self, id: Uuid, passid: Uuid) -> ResultP<()> {
         let _ck = self.get_user(id).await?;
+        if let Ok(recipients) = self.shared_passes.get_shared_by_user_and_pass(id, passid).await {
+            for recipient in recipients {
+                self.shared_passes.remove_shared_pass(id, passid, recipient).await?;
+            }
+        }
         self.passes.remove_pass(id, passid).await?;
         Ok(())
     }
@@ -701,14 +767,14 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         recipient: Uuid,
         shared_pass: SharedPass,
     ) -> ResultP<()> {
+        // Sérialiser le mot de passe partagé
         let shared_serialized = bincode::serialize(&shared_pass)
             .map_err(|_| ProtocolError::DataError)?;
-        self.shared_passes.store_shared_pass(
-            owner,
-            pass_id,
-            recipient,
-            shared_serialized
-        ).await
+            
+        // Stocker dans la base de données
+        self.shared_passes
+            .store_shared_pass(owner, pass_id, recipient, shared_serialized)
+            .await
     }
 
     /// Révoquer le partage
@@ -1017,74 +1083,23 @@ impl Client {
     }
 }
 
-#[derive(Clone)]
-pub struct Shard {
-    data: Share,
-}
-
-impl Serialize for Shard {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let vec: Vec<u8> = (&self.clone().data).into();
-        serializer.serialize_bytes(vec.as_slice())
-    }
-}
-
-impl<'de> Deserialize<'de> for Shard {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct ShardVisitor;
-
-        impl<'de> Visitor<'de> for ShardVisitor {
-            type Value = Shard;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a byte array")
-            }
-
-            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                // Assuming Share can be constructed from a byte slice
-                //
-                let data: Share =
-                    Share::try_from(v).map_err(|_| de::Error::invalid_length(v.len(), &self))?;
-                Ok(Shard { data })
-            }
-        }
-
-        deserializer.deserialize_bytes(ShardVisitor)
-    }
-}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Shards {
-    data: Vec<Shard>,
+    data: Vec<Vec<u8>>,
 }
 
 impl Shards {
-    pub fn new(ret_num: u8, secret: &[u8]) -> Shards {
-        let shards = Sharks(3);
-        let dealer = shards.dealer(secret);
-        let data = dealer
-            .take(ret_num.into())
-            .map(|x| Shard { data: x })
-            .collect();
-        Shards { data }
+    pub fn new(ret_num: u8, secret: &[u8]) -> ResultP<Shards> {
+        let threshold = 3; // Nombre minimum de parts nécessaires pour reconstruire le secret
+        let shares = sss_rs::prelude::share(&secret, threshold, ret_num, true)
+            .map_err(|_| ProtocolError::CryptoError)?;
+        Ok(Shards { data: shares })
     }
 
     pub fn recover(self) -> ResultP<Vec<u8>> {
-        let shards = Sharks(3);
-        let slice: Vec<Share> = self.data.iter().map(|x| x.data.clone()).collect();
-        let secret = shards
-            .recover(&slice)
-            .map_err(|_| ProtocolError::CryptoError);
-        secret
+        let secret = sss_rs::prelude::reconstruct(&self.data, true).map_err(|_| ProtocolError::CryptoError)?;
+        Ok(secret)
     }
 }
 
@@ -1152,10 +1167,9 @@ mod tests {
     #[test]
     fn test_shards() {
         let secret = b"test secret";
-        let shards = Shards::new(5, secret);
-        let recovered = shards.clone().recover();
-        assert!(recovered.is_ok());
-        assert_eq!(recovered.unwrap(), secret);
+        let shards = Shards::new(5, secret).unwrap();
+        let recovered = shards.recover().unwrap();
+        assert_eq!(recovered, secret);
     }
 
     #[test]

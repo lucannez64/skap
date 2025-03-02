@@ -55,22 +55,29 @@ impl ApiError {
         };
 
         if is_json {
-            // Pour les routes JSON
-            let json = warp::reply::json(&ErrorMessage {
-                code: code,
-                message: message.to_string(),
-            });
-            warp::reply::with_status(json, warp::http::StatusCode::from_u16(code).unwrap())
-                .into_response()
+            self.create_json_response(code, message)
         } else {
-            // Pour les routes binaires
-            let error_response = bincode::serialize(&message).unwrap_or_default();
-            warp::reply::with_status(
-                warp::reply::Response::new(error_response.into()),
-                warp::http::StatusCode::from_u16(code).unwrap(),
-            )
-            .into_response()
+            self.create_binary_response(code, message)
         }
+    }
+
+    // Méthodes privées pour créer des réponses spécifiques au format
+    fn create_json_response(&self, code: u16, message: &str) -> Response {
+        let json = warp::reply::json(&ErrorMessage {
+            code,
+            message: message.to_string(),
+        });
+        warp::reply::with_status(json, warp::http::StatusCode::from_u16(code).unwrap())
+            .into_response()
+    }
+
+    fn create_binary_response(&self, code: u16, message: &str) -> Response {
+        let error_response = bincode::serialize(&message).unwrap_or_default();
+        warp::reply::with_status(
+            warp::reply::Response::new(error_response.into()),
+            warp::http::StatusCode::from_u16(code).unwrap(),
+        )
+        .into_response()
     }
 
     // Méthodes d'aide pour créer des réponses spécifiques au format
@@ -121,15 +128,14 @@ async fn auth_validation(
 
     let sub = claims
         .get_claim("sub")
-        .ok_or_else(|| {
-            ApiError::Unauthorized("No subject claim in token".to_string()).to_response(is_json)
-        })?
+        .ok_or_else(|| ApiError::Unauthorized("No subject claim in token".to_string()).to_response(is_json))?
         .as_str()
-        .ok_or_else(|| {
-            ApiError::Unauthorized("Invalid subject claim format".to_string()).to_response(is_json)
-        })?;
+        .ok_or_else(|| ApiError::Unauthorized("Invalid subject claim format".to_string()).to_response(is_json))?;
 
-    if uuid.replace("-", "").replace("\"", "") == sub.replace("-", "").replace("\"", "") {
+    let normalized_uuid = uuid.replace('-', "").replace('"', "");
+    let normalized_sub = sub.replace('-', "").replace('"', "");
+    
+    if normalized_uuid == normalized_sub {
         Ok(())
     } else {
         Err(ApiError::Unauthorized("UUID mismatch".to_string()).to_response(is_json))
@@ -1189,9 +1195,7 @@ async fn create_pass_map(
 ) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui);
-    log::warn!("Creating pass for user: {}", uui);
     let ep = bincode::deserialize::<EP>(&pass);
-    log::warn!("EP: {:?}", ep);
     if id.is_err() || ep.is_err() {
         return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).into());
     }
@@ -1209,8 +1213,6 @@ async fn create_pass_json_map(
     server2: &ServerArc,
 ) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
-    log::info!("Creating pass for user: {}", uui);
-    log::info!("Pass: {:?}", pass);
     let id = match uuid::Uuid::parse_str(&uui) {
         Ok(uuid) => uuid,
         Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
@@ -1360,6 +1362,13 @@ async fn send_all_json_map(uui: String, server2: &ServerArc) -> Result<Response,
     }
 }
 
+// Fonction utilitaire pour parser un UUID avec gestion d'erreur
+fn parse_uuid(uuid_str: &str, field_name: &str, is_json: bool) -> Result<Uuid, Response> {
+    uuid::Uuid::parse_str(uuid_str).map_err(|_| {
+        ApiError::BadRequest(format!("Invalid UUID format for {}", field_name)).to_response(is_json)
+    })
+}
+
 async fn share_pass_map(
     owner: String,
     pass_id: String,
@@ -1369,27 +1378,19 @@ async fn share_pass_map(
 ) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
 
-    let owner_id = match uuid::Uuid::parse_str(&owner) {
+    let owner_id = match parse_uuid(&owner, "owner ID", false) {
         Ok(uuid) => uuid,
-        Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for owner ID".to_string()).into())
-        }
+        Err(response) => return Ok(response),
     };
 
-    let pass_uuid = match uuid::Uuid::parse_str(&pass_id) {
+    let pass_uuid = match parse_uuid(&pass_id, "pass ID", false) {
         Ok(uuid) => uuid,
-        Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).into())
-        }
+        Err(response) => return Ok(response),
     };
 
-    let recipient_id = match uuid::Uuid::parse_str(&recipient) {
+    let recipient_id = match parse_uuid(&recipient, "recipient ID", false) {
         Ok(uuid) => uuid,
-        Err(_) => {
-            return Ok(
-                ApiError::BadRequest("Invalid UUID format for recipient ID".to_string()).into(),
-            )
-        }
+        Err(response) => return Ok(response),
     };
 
     let shared_pass = match bincode::deserialize::<crate::protocol::SharedPass>(&shared_pass) {
@@ -1421,27 +1422,19 @@ async fn share_pass_json_map(
 ) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
 
-    let owner_id = match uuid::Uuid::parse_str(&owner) {
+    let owner_id = match parse_uuid(&owner, "owner ID", true) {
         Ok(uuid) => uuid,
-        Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for owner ID".to_string()).to_response(true))
-        }
+        Err(response) => return Ok(response),
     };
 
-    let pass_uuid = match uuid::Uuid::parse_str(&pass_id) {
+    let pass_uuid = match parse_uuid(&pass_id, "pass ID", true) {
         Ok(uuid) => uuid,
-        Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true))
-        }
+        Err(response) => return Ok(response),
     };
 
-    let recipient_id = match uuid::Uuid::parse_str(&recipient) {
+    let recipient_id = match parse_uuid(&recipient, "recipient ID", true) {
         Ok(uuid) => uuid,
-        Err(_) => {
-            return Ok(
-                ApiError::BadRequest("Invalid UUID format for recipient ID".to_string()).to_response(true)
-            )
-        }
+        Err(response) => return Ok(response),
     };
 
     match server
