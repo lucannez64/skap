@@ -1,6 +1,6 @@
 use redis::{Client, Commands, RedisError};
 use uuid::Uuid;
-use crate::protocol::{SecretsT, ChallengesT, ProtocolError, ResultP};
+use crate::protocol::{SecretsT, ChallengesT, ProtocolError, ResultP, KYBER_CIPHERTEXTBYTES};
 use std::time::Duration;
 
 // Constantes pour les préfixes de clés
@@ -84,22 +84,46 @@ impl RedisChallenges {
 }
 
 impl SecretsT for RedisSecrets {
-    fn get_secret(&self, id: Uuid) -> ResultP<[u8; 32]> {
+    fn get_secret(&self, id: Uuid) -> ResultP<Option<([u8; 32], [u8; KYBER_CIPHERTEXTBYTES])>> {
         let mut con = self.get_connection()?;
-        let bytes: Vec<u8> = handle_redis_error!(con.get(Self::make_key(id)))?;
-        vec_to_array(bytes)
+        let key = Self::make_key(id);
+        
+        match handle_redis_error!(con.get::<_, Vec<u8>>(key)) {
+            Ok(bytes) => {
+                if bytes.len() == 32 + KYBER_CIPHERTEXTBYTES {
+                    let mut secret = [0u8; 32];
+                    let mut ciphertext = [0u8; KYBER_CIPHERTEXTBYTES];
+                    
+                    secret.copy_from_slice(&bytes[..32]);
+                    ciphertext.copy_from_slice(&bytes[32..]);
+                    
+                    Ok(Some((secret, ciphertext)))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(_) => Ok(None)
+        }
     }
 
-    fn add_secret(&mut self, id: Uuid, secret: [u8; 32]) {
-        if let Ok(mut con) = self.get_connection() {
-            let key = Self::make_key(id);
-            let expiry = Duration::from_secs(SECRET_EXPIRATION_SECS);
-            
-            if let Err(e) = con.set_ex::<_, _, ()>(key, secret.to_vec(), expiry.as_secs()) {
-                eprintln!("Error adding secret: {}", e);
+    fn add_secret(&mut self, id: Uuid, secret: [u8; 32], ciphertext: [u8; KYBER_CIPHERTEXTBYTES]) {
+        let mut con = match self.get_connection() {
+            Ok(con) => con,
+            Err(e) => {
+                eprintln!("Failed to get Redis connection: {}", e);
+                return;
             }
-        } else {
-            eprintln!("Failed to get Redis connection for adding secret");
+        };
+
+        let key = Self::make_key(id);
+        let expiry = Duration::from_secs(SECRET_EXPIRATION_SECS);
+        
+        let mut bytes = Vec::with_capacity(32 + KYBER_CIPHERTEXTBYTES);
+        bytes.extend_from_slice(&secret);
+        bytes.extend_from_slice(&ciphertext);
+
+        if let Err(e) = con.set_ex::<_, _, ()>(key, bytes, expiry.as_secs()) {
+            eprintln!("Error adding secret: {}", e);
         }
     }
 }

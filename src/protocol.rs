@@ -257,7 +257,7 @@ pub struct Server<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedP
     shared_passes: F,
 }
 
-pub struct Secrets(HashMap<Uuid, [u8; 32]>);
+pub struct Secrets(HashMap<Uuid, ([u8; 32], [u8; KYBER_CIPHERTEXTBYTES])>);
 
 pub struct Passes(HashMap<(Uuid, Uuid), Vec<u8>>);
 
@@ -340,8 +340,8 @@ impl UsersT for Users {
 }
 
 pub trait SecretsT {
-    fn get_secret(&self, id: Uuid) -> ResultP<[u8; 32]>;
-    fn add_secret(&mut self, id: Uuid, secret: [u8; KYBER_SSBYTES]);
+    fn get_secret(&self, id: Uuid) -> ResultP<Option<([u8; 32], [u8; KYBER_CIPHERTEXTBYTES])>>;
+    fn add_secret(&mut self, id: Uuid, secret: [u8; KYBER_SSBYTES], ciphertext: [u8; KYBER_CIPHERTEXTBYTES]);
 }
 
 pub trait ChallengesT {
@@ -536,12 +536,13 @@ impl PassesT for Passes {
 }
 
 impl SecretsT for Secrets {
-    fn get_secret(&self, id: Uuid) -> ResultP<[u8; 32]> {
-        self.0.get(&id).cloned().ok_or(ProtocolError::StorageError)
+    fn get_secret(&self, id: Uuid) -> ResultP<Option<([u8; 32], [u8; KYBER_CIPHERTEXTBYTES])>> {
+        let secret = self.0.get(&id).cloned();
+        Ok(secret)
     }
 
-    fn add_secret(&mut self, id: Uuid, secret: [u8; 32]) {
-        self.0.insert(id, secret);
+    fn add_secret(&mut self, id: Uuid, secret: [u8; 32], ciphertext: [u8; KYBER_CIPHERTEXTBYTES]) {
+        self.0.insert(id, (secret, ciphertext));
     }
 }
 
@@ -655,35 +656,49 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
 
     pub async fn sync(&mut self, id: Uuid) -> ResultP<[u8; KYBER_CIPHERTEXTBYTES]> {
         let ck = self.get_user(id).await?;
+        let option = self.secrets.get_secret(id)?;
+        if let Some((secret, ciphertext)) = option {
+            let ciphertext2: [u8; KYBER_CIPHERTEXTBYTES] = ciphertext.try_into()
+                .map_err(|_| ProtocolError::CryptoError)?;
+            return Ok(ciphertext2);
+        }
         let pk = MlKem1024PublicKey::from(ck.ky_p.clone());
         let randomness = random_array();
         let (ciphertext, secret) = mlkem1024::encapsulate(&pk, randomness);
-        self.secrets.add_secret(id, secret);
+        self.secrets.add_secret(id, secret, *ciphertext.as_slice());
         Ok(*ciphertext.as_slice())
     }
 
     pub async fn send(&self, id: Uuid, pass_id: Uuid) -> ResultP<EP> {
         let _ck = self.get_user(id).await?;
-        let secret = self.secrets.get_secret(id)?;
-        let hash = hash(&secret);
-        let key: &Key = Key::from_slice(hash.as_bytes());
-        let cipher = XChaCha20Poly1305::new(key);
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let pass = self.passes.get_pass(id, pass_id).await?;
-        let passs: EP = bincode::deserialize(&pass).unwrap();
-        let ciphertext = cipher
-            .encrypt(&nonce, passs.ciphertext.as_slice())
-            .map_err(|_| ProtocolError::CryptoError)?;
-        Ok(EP {
-            ciphertext,
-            nonce: passs.nonce,
-            nonce2: Some(nonce.to_vec()),
-        })
+        let option = self.secrets.get_secret(id)?;
+        if let Some((secret, ciphertext)) = option {
+            let hash = hash(&secret);
+            let key: &Key = Key::from_slice(hash.as_bytes());
+            let cipher = XChaCha20Poly1305::new(key);
+            let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+            let pass = self.passes.get_pass(id, pass_id).await?;
+            let passs: EP = bincode::deserialize(&pass).unwrap();
+            let ciphertext = cipher
+                .encrypt(&nonce, passs.ciphertext.as_slice())
+                .map_err(|_| ProtocolError::CryptoError)?;
+            Ok(EP {
+                ciphertext,
+                nonce: passs.nonce,
+                nonce2: Some(nonce.to_vec()),
+            })
+        } else {
+            Err(ProtocolError::StorageError)
+        }
     }
 
     pub async fn send_all(&self, id: Uuid) -> ResultP<Vec<(EP, Uuid)>> {
         let _ = self.get_user(id).await?;
-        let secret = self.secrets.get_secret(id)?;
+        let option = self.secrets.get_secret(id)?;
+        if let None = option {
+            return Err(ProtocolError::StorageError);
+        }
+        let (secret, ciphertext) = option.unwrap();
         let hash = hash(&secret);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
@@ -716,7 +731,11 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
 
     pub async fn create_pass(&mut self, id: Uuid, pass: EP) -> ResultP<Uuid> {
         let _ck = self.get_user(id).await?;
-        let secret = self.secrets.get_secret(id)?;
+        let option = self.secrets.get_secret(id)?;
+        if let None = option {
+            return Err(ProtocolError::StorageError);
+        }
+        let (secret, ciphertext) = option.unwrap();
         let id2 = Uuid::new_v4();
         let hash = hash(&secret);
         let key: &Key = Key::from_slice(hash.as_bytes());
@@ -742,7 +761,11 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
 
     pub async fn update_pass(&mut self, id: Uuid, passid: Uuid, pass: EP) -> ResultP<()> {
         let _ck = self.get_user(id).await?;
-        let secret = self.secrets.get_secret(id)?;
+        let option = self.secrets.get_secret(id)?;
+        if let None = option {
+            return Err(ProtocolError::StorageError);
+        }
+        let (secret, ciphertext) = option.unwrap();
         let hash = hash(&secret);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
