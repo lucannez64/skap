@@ -2,6 +2,7 @@ use base64::Engine;
 use blake3::hash;
 use chacha20poly1305::consts::P2;
 use thiserror::Error;
+use serde_repr::{Serialize_repr, Deserialize_repr};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[cfg(feature = "server")]
@@ -226,6 +227,15 @@ pub struct SharedPass {
     pub kem_ct: Vec<u8>,
     /// Le mot de passe chiffré (EP) avec la clé partagée
     pub ep: EP,
+    pub status: ShareStatus,
+}
+
+#[derive(Clone, Debug, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+pub enum ShareStatus {
+    Pending = 0,
+    Accepted = 1,
+    Rejected = 2,
 }
 
 /// Collection pour stocker les mots de passe partagés
@@ -396,6 +406,7 @@ pub trait SharedPassesT {
         owner: Uuid,
         pass_id: Uuid
     ) -> ResultP<Vec<Uuid>>;
+    
 }
 
 
@@ -484,6 +495,7 @@ impl SharedPassesT for SharedPasses {
             Err(ProtocolError::StorageError)
         }
     }
+
 }
 
 impl PassesT for Passes {
@@ -601,7 +613,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
 
     pub async fn get_all_shared_passes(&self, recipient: Uuid) -> ResultP<Vec<(SharedPass, Uuid, Uuid)>> {
         let mut shared_passes = Vec::new();
-        let mut shared_data = self.shared_passes.get_all_shared_passes(recipient).await?;
+        let shared_data = self.shared_passes.get_all_shared_passes(recipient).await?;
         
         for (data, owner_id, pass_id) in shared_data {
             let shared_pass = bincode::deserialize(&data)
@@ -768,7 +780,14 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         shared_pass: SharedPass,
     ) -> ResultP<()> {
         // Sérialiser le mot de passe partagé
-        let shared_serialized = bincode::serialize(&shared_pass)
+        let mut shared_pass2 = shared_pass.clone();
+        if let Ok(a) = self.shared_passes.get_shared_pass(recipient, owner, pass_id).await {
+            let shared_pass3: SharedPass = bincode::deserialize(&a).unwrap();
+            shared_pass2.status = shared_pass3.status;
+        } else {
+            shared_pass2.status = ShareStatus::Pending;
+        }
+        let shared_serialized = bincode::serialize(&shared_pass2)
             .map_err(|_| ProtocolError::DataError)?;
             
         // Stocker dans la base de données
@@ -810,6 +829,50 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         let shared_by_user: Vec<SharedByUser> = self.shared_passes.get_shared_by_user(owner).await?;
         Ok(shared_by_user)
     }
+
+    pub async fn accept_shared_pass(
+        &mut self,
+        owner: Uuid,
+        pass_id: Uuid,
+        recipient: Uuid
+    ) -> ResultP<()> {
+        let mut shared_pass = self.get_shared_pass(recipient, owner, pass_id).await?;
+        shared_pass.status = ShareStatus::Accepted;
+        let shared_serialized = bincode::serialize(&shared_pass)
+            .map_err(|_| ProtocolError::DataError)?;
+        self.shared_passes.store_shared_pass(owner, pass_id, recipient, shared_serialized).await?;
+        Ok(())
+    }
+
+    pub async fn get_shared_pass_status(
+        &self,
+        owner: Uuid,
+        pass_id: Uuid,
+        recipient: Uuid
+    ) -> ResultP<ShareStatus> {
+        let shared_data = self.shared_passes
+            .get_shared_pass(recipient, owner, pass_id)
+            .await?;
+        let shared_pass: SharedPass = bincode::deserialize(&shared_data)
+            .map_err(|_| ProtocolError::DataError)?;
+        Ok(shared_pass.status)
+    }
+    
+
+    pub async fn reject_shared_pass(
+        &mut self,
+        owner: Uuid,
+        pass_id: Uuid,
+        recipient: Uuid
+    ) -> ResultP<()> {
+        let mut shared_pass = self.get_shared_pass(recipient, owner, pass_id).await?;
+        shared_pass.status = ShareStatus::Rejected;
+        let shared_serialized = bincode::serialize(&shared_pass)
+            .map_err(|_| ProtocolError::DataError)?;
+        self.shared_passes.store_shared_pass(owner, pass_id, recipient, shared_serialized).await?;
+        Ok(())
+    }
+    
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1051,6 +1114,7 @@ impl Client {
                 nonce: shared_nonce.to_vec(),
                 nonce2: None,
             },
+            status: ShareStatus::Pending,
         })
     }
 

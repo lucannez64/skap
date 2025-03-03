@@ -275,7 +275,7 @@ impl SharedPassesT for SharedPassesPostgres {
                 database.prepare_cached(SQL_UPDATE_SHARED_PASS).await,
                 "Error preparing update_shared_pass statement"
             )?;
-            handle_db_error!(database.execute(&stmt, &[&owner, &pass_id, &recipient, &shared_pass]).await, "Error removing existing shared pass")?;
+            handle_db_error!(database.execute(&stmt, &[&owner, &pass_id, &recipient, &shared_pass]).await, "Error updating existing shared pass")?;
         } else {
             let stmt = handle_db_error!(
                 database.prepare_cached(SQL_INSERT_SHARED_PASS).await,
@@ -301,7 +301,6 @@ impl SharedPassesT for SharedPassesPostgres {
             database.prepare_cached(SQL_SELECT_SHARED_PASS).await,
             "Error preparing get_shared_pass statement"
         )?;
-
         let row = handle_db_error!(
             database.query_one(&stmt, &[&owner, &pass_id, &recipient]).await,
             "Error getting shared pass"

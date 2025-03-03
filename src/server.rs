@@ -111,34 +111,38 @@ pub type ServerArc = Arc<
 async fn auth_validation(
     sk: Arc<RwLock<SymmetricKey<V4>>>,
     uuid: &str,
-    token: String,
+    token: Option<String>,
     is_json: bool,
 ) -> Result<(), Response> {
-    let sk = sk.read().await;
-    let validation = ClaimsValidationRules::new();
-    let untrusted_token = UntrustedToken::<Local, V4>::try_from(&token)
+    if let Some(token) = token {
+        let sk = sk.read().await;
+        let validation = ClaimsValidationRules::new();
+        let untrusted_token = UntrustedToken::<Local, V4>::try_from(&token)
         .map_err(|_| ApiError::Unauthorized("Invalid token format".to_string()).to_response(is_json))?;
 
-    let trusted_token = local::decrypt(&sk, &untrusted_token, &validation, None, Some(b"skap"))
-        .map_err(|_| ApiError::Unauthorized("Token validation failed".to_string()).to_response(is_json))?;
+        let trusted_token = local::decrypt(&sk, &untrusted_token, &validation, None, Some(b"skap"))
+            .map_err(|_| ApiError::Unauthorized("Token validation failed".to_string()).to_response(is_json))?;
 
-    let claims = trusted_token
-        .payload_claims()
-        .ok_or_else(|| ApiError::Unauthorized("No claims in token".to_string()).to_response(is_json))?;
+        let claims = trusted_token
+            .payload_claims()
+            .ok_or_else(|| ApiError::Unauthorized("No claims in token".to_string()).to_response(is_json))?;
 
-    let sub = claims
-        .get_claim("sub")
-        .ok_or_else(|| ApiError::Unauthorized("No subject claim in token".to_string()).to_response(is_json))?
-        .as_str()
-        .ok_or_else(|| ApiError::Unauthorized("Invalid subject claim format".to_string()).to_response(is_json))?;
+        let sub = claims
+            .get_claim("sub")
+            .ok_or_else(|| ApiError::Unauthorized("No subject claim in token".to_string()).to_response(is_json))?
+            .as_str()
+            .ok_or_else(|| ApiError::Unauthorized("Invalid subject claim format".to_string()).to_response(is_json))?;
 
-    let normalized_uuid = uuid.replace('-', "").replace('"', "");
-    let normalized_sub = sub.replace('-', "").replace('"', "");
-    
-    if normalized_uuid == normalized_sub {
-        Ok(())
+        let normalized_uuid = uuid.replace('-', "").replace('"', "");
+        let normalized_sub = sub.replace('-', "").replace('"', "");
+        
+        if normalized_uuid == normalized_sub {
+            Ok(())
+        } else {
+            Err(ApiError::Unauthorized("UUID mismatch".to_string()).to_response(is_json))
+        }
     } else {
-        Err(ApiError::Unauthorized("UUID mismatch".to_string()).to_response(is_json))
+        Err(ApiError::Unauthorized("No token".to_string()).to_response(is_json))
     }
 }
 
@@ -246,7 +250,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mutexsk = Arc::new(RwLock::new(sk));
     let server_filter = warp::any().map(move || Arc::clone(&server2));
     let mutexsk_filter = warp::any().map(move || Arc::clone(&mutexsk));
-    let cookies_filter = warp::filters::cookie::cookie("token");
+    let cookies_filter = warp::filters::cookie::optional("token");
+    let header_filter = warp::filters::header::optional("Authorization");
     let create_user_json = warp::post()
         .and(warp::path("create_user_json"))
         .and(warp::body::json())
@@ -262,13 +267,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .and(server_filter.clone())
             .and(mutexsk_filter.clone())
             .and(cookies_filter.clone())
+            .and(header_filter.clone())
             .and_then(
                 |uui: String,
                  server2: ServerArc,
                  sk: Arc<RwLock<SymmetricKey<V4>>>,
-                 token: String| async move {
-                    if let Err(response) = auth_validation(sk, &uui, token, false).await {
-                        return Ok(response);
+                 token: Option<String>,
+                 header: Option<String>| async move {
+                    if let Some(token) = token {
+                        if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
+                            return Ok(response);
+                        }
+                    } else {
+                        if let Err(response) = auth_validation(sk, &uui, header, false).await {
+                            return Ok(response);
+                        }
                     }
                     send_all_map(uui, &server2).await
                 },
@@ -281,13 +294,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .and(server_filter.clone())
             .and(mutexsk_filter.clone())
             .and(cookies_filter.clone())
+            .and(header_filter.clone())
             .and_then(
                 |uui: String,
                  server2: ServerArc,
                  sk: Arc<RwLock<SymmetricKey<V4>>>,
-                 token: String| async move {
-                    if let Err(response) = auth_validation(sk, &uui, token, true).await {
-                        return Ok(response);
+                 token: Option<String>,
+                 header: Option<String>| async move {
+                    if let Some(token) = token {
+                        if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
+                            return Ok(response);
+                        }
+                    } else {
+                        if let Err(response) = auth_validation(sk, &uui, header, true).await {
+                            return Ok(response);
+                        }
                     }
                     send_all_json_map(uui, &server2).await
                 },
@@ -308,13 +329,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .and(server_filter.clone())
             .and(mutexsk_filter.clone())
             .and(cookies_filter.clone())
+            .and(header_filter.clone())
             .and_then(
                 |uui: String,
                  server2: ServerArc,
                  sk: Arc<RwLock<SymmetricKey<V4>>>,
-                 token: String| async move {
-                    if let Err(response) = auth_validation(sk, &uui, token, true).await {
-                        return Ok(response);
+                 token: Option<String>,
+                 header: Option<String>| async move {
+                    if let Some(token) = token {
+                        if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
+                            return Ok(response);
+                        }
+                    } else {
+                        if let Err(response) = auth_validation(sk, &uui, header, true).await {
+                            return Ok(response);
+                        }
                     }
                     sync_json_map(uui, &server2).await
                 },
@@ -327,13 +356,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .and(server_filter.clone())
             .and(mutexsk_filter.clone())
             .and(cookies_filter.clone())
+            .and(header_filter.clone())
             .and_then(
                 |uui: String,
                  server2: ServerArc,
                  sk: Arc<RwLock<SymmetricKey<V4>>>,
-                 token: String| async move {
-                    if let Err(response) = auth_validation(sk, &uui, token, false).await {
-                        return Ok(response);
+                 token: Option<String>,
+                 header: Option<String>| async move {
+                    if let Some(token) = token {
+                        if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
+                            return Ok(response);
+                        }
+                    } else {
+                        if let Err(response) = auth_validation(sk, &uui, header, false).await {
+                            return Ok(response);
+                        }
                     }
                     sync_map(uui, &server2).await
                 },
@@ -346,14 +383,22 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
             |uui: String,
              pass: bytes::Bytes,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
-             token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token, false).await {
-                    return Ok(response);
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &uui, header, false).await {
+                        return Ok(response);
+                    }
                 }
                 create_pass_map(uui, pass, &server2).await
             },
@@ -366,14 +411,22 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
             |uui: String,
              pass: EP,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
-             token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token, true).await {
-                    return Ok(response);
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &uui, header, true).await {
+                        return Ok(response);
+                    }
                 }
                 create_pass_json_map(uui, pass, &server2).await
             },
@@ -433,15 +486,23 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
             |uui: String,
              uui2: String,
              pass: bytes::Bytes,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
-             token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token, false).await {
-                    return Ok(response);
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &uui, header, false).await {
+                        return Ok(response);
+                    }
                 }
                 update_pass_map(uui, uui2, pass, &server2).await
             },
@@ -455,15 +516,23 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
             |uui: String,
              uui2: String,
              pass: EP,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
-             token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token, true).await {
-                    return Ok(response);
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &uui, header, true).await {
+                        return Ok(response);
+                    }
                 }
                 update_pass_json_map(uui, uui2, pass, &server2).await
             },
@@ -476,14 +545,22 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
             |uui: String,
              uui2: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
-             token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token, false).await {
-                    return Ok(response);
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &uui, header, false).await {
+                        return Ok(response);
+                    }
                 }
                 delete_map(uui, uui2, &server2).await
             },
@@ -496,14 +573,22 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
             |uui: String,
              uui2: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
-             token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token, true).await {
-                    return Ok(response);
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &uui, header, true).await {
+                        return Ok(response);
+                    }
                 }
                 delete_json_map(uui, uui2, &server2).await
             },
@@ -516,14 +601,22 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
             |uui: String,
              uui2: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
-             token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token, false).await {
-                    return Ok(response);
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &uui, header, false).await {
+                        return Ok(response);
+                    }
                 }
                 send_map(uui, uui2, &server2).await
             },
@@ -536,14 +629,22 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
             |uui: String,
              uui2: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
-             token: String| async move {
-                if let Err(response) = auth_validation(sk, &uui, token, true).await {
-                    return Ok(response);
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &uui, header, true).await {
+                        return Ok(response);
+                    }
                 }
                 send_json_map(uui, uui2, &server2).await
             },
@@ -558,6 +659,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
             |owner: String,
              pass_id: String,
@@ -565,9 +667,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              shared_pass: bytes::Bytes,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
-             token: String| async move {
-                if let Err(response) = auth_validation(sk, &owner, token, false).await {
-                    return Ok(response);
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &owner, Some(token), false).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &owner, header, false).await {
+                        return Ok(response);
+                    }
                 }
                 share_pass_map(owner, pass_id, recipient, shared_pass, &server2).await
             },
@@ -582,6 +691,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
             |owner: String,
              pass_id: String,
@@ -589,9 +699,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              shared_pass: crate::protocol::SharedPass,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
-             token: String| async move {
-                if let Err(response) = auth_validation(sk, &owner, token, true).await {
-                    return Ok(response);
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &owner, Some(token), true).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &owner, header, true).await {
+                        return Ok(response);
+                    }
                 }
                 share_pass_json_map(owner, pass_id, recipient, shared_pass, &server2).await
             },
@@ -605,15 +722,23 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
             |owner: String,
              pass_id: String,
              recipient: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
-             token: String| async move {
-                if let Err(response) = auth_validation(sk, &owner, token, false).await {
-                    return Ok(response);
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &owner, Some(token), false).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &owner, header, false).await {
+                        return Ok(response);
+                    }
                 }
                 unshare_pass_map(owner, pass_id, recipient, &server2).await
             },
@@ -627,15 +752,23 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
             |owner: String,
              pass_id: String,
              recipient: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
-             token: String| async move {
-                if let Err(response) = auth_validation(sk, &owner, token, true).await {
-                    return Ok(response);
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &owner, Some(token), true).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &owner, header, true).await {
+                        return Ok(response);
+                    }
                 }
                 unshare_pass_json_map(owner, pass_id, recipient, &server2).await
             },
@@ -649,15 +782,23 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
             |recipient: String,
              owner: String,
              pass_id: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
-             token: String| async move {
-                if let Err(response) = auth_validation(sk, &recipient, token, false).await {
-                    return Ok(response);
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &recipient, Some(token), false).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &recipient, header, false).await {
+                        return Ok(response);
+                    }
                 }
                 get_shared_pass_map(recipient, owner, pass_id, &server2).await
             },
@@ -671,15 +812,23 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
             |recipient: String,
              owner: String,
              pass_id: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
-             token: String| async move {
-                if let Err(response) = auth_validation(sk, &recipient, token, true).await {
-                    return Ok(response);
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &recipient, Some(token), true).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &recipient, header, true).await {
+                        return Ok(response);
+                    }
                 }
                 get_shared_pass_json_map(recipient, owner, pass_id, &server2).await
             },
@@ -715,10 +864,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
         .and(cookies_filter.clone())
+        .and(header_filter.clone())
         .and_then(
-            |owner: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: String| async move {
-                if let Err(response) = auth_validation(sk, &owner, token, false).await {
-                    return Ok(response);
+            |owner: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: Option<String>, header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &owner, Some(token), false).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &owner, header, false).await {
+                        return Ok(response);
+                    }
                 }
                 get_shared_by_user_map(owner, &server2).await
             },
@@ -746,6 +902,149 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let home = warp::get().and(warp::path::end()).and_then(|| async move {
         Ok::<warp::reply::Response, Infallible>(warp::reply::Response::new("Hello, world!".into()))
     });
+
+    let accept_shared_pass = warp::get()
+        .and(warp::path("accept_shared_pass"))
+        .and(warp::path::param::<String>()) // recipient id
+        .and(warp::path::param::<String>()) // owner id
+        .and(warp::path::param::<String>()) // pass id
+        .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and(header_filter.clone())
+        .and_then(
+            |recipient: String, owner: String, pass_id: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: Option<String>, header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &recipient, Some(token), false).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &recipient, header, false).await {
+                        return Ok(response);
+                    }
+                }
+                accept_shared_pass_map(recipient, owner, pass_id, &server2).await
+            },
+        );
+
+    let accept_shared_pass_json = warp::get()
+        .and(warp::path("accept_shared_pass_json"))
+        .and(warp::path::param::<String>()) // recipient id
+        .and(warp::path::param::<String>()) // owner id
+        .and(warp::path::param::<String>()) // pass id
+        .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and(header_filter.clone())
+        .and_then(
+            |recipient: String, owner: String, pass_id: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: Option<String>, header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &recipient, Some(token), true).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &recipient, header, true).await {
+                        return Ok(response);
+                    }
+                }
+                accept_shared_pass_json_map(recipient, owner, pass_id, &server2).await
+            },
+        );
+
+    let reject_shared_pass = warp::get()
+        .and(warp::path("reject_shared_pass"))
+        .and(warp::path::param::<String>()) // recipient id
+        .and(warp::path::param::<String>()) // owner id
+        .and(warp::path::param::<String>()) // pass id
+        .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and(header_filter.clone())
+        .and_then(
+            |recipient: String, owner: String, pass_id: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: Option<String>, header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &recipient, Some(token), false).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &recipient, header, false).await {
+                        return Ok(response);
+                    }
+                }
+                reject_shared_pass_map(recipient, owner, pass_id, &server2).await
+            },
+        );
+
+    let reject_shared_pass_json = warp::get()
+        .and(warp::path("reject_shared_pass_json"))
+        .and(warp::path::param::<String>()) // recipient id
+        .and(warp::path::param::<String>()) // owner id
+        .and(warp::path::param::<String>()) // pass id
+        .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and(header_filter.clone())
+        .and_then(
+            |recipient: String, owner: String, pass_id: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: Option<String>, header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &recipient, Some(token), true).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &recipient, header, true).await {
+                        return Ok(response);
+                    }
+                }
+                reject_shared_pass_json_map(recipient, owner, pass_id, &server2).await
+            },
+        );
+
+    let get_shared_pass_status = warp::get()
+        .and(warp::path("get_shared_pass_status"))
+        .and(warp::path::param::<String>()) // owner id
+        .and(warp::path::param::<String>()) // pass id
+        .and(warp::path::param::<String>()) // recipient id
+        .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and(header_filter.clone())
+        .and_then(
+            |owner: String, pass_id: String, recipient: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: Option<String>, header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &owner, Some(token), false).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &owner, header, false).await {
+                        return Ok(response);
+                    }
+                }
+                get_shared_pass_status_map(owner, pass_id, recipient, &server2).await
+            },
+        );
+    let get_shared_pass_status_json = warp::get()
+        .and(warp::path("get_shared_pass_status_json"))
+        .and(warp::path::param::<String>()) // owner id
+        .and(warp::path::param::<String>()) // pass id
+        .and(warp::path::param::<String>()) // recipient id
+        .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and(header_filter.clone())
+        .and_then(
+            |owner: String, pass_id: String, recipient: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: Option<String>, header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &owner, Some(token), true).await {
+                        return Ok(response);
+                    }
+                } else {
+                    if let Err(response) = auth_validation(sk, &owner, header, true).await {
+                        return Ok(response);
+                    }
+                }
+                get_shared_pass_status_json_map(owner, pass_id, recipient, &server2).await
+            },
+        );
 
     let routes = create_user
         .or(challenge)
@@ -776,7 +1075,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .or(get_shared_by_user)
         .or(get_uuids_from_emails)
         .or(get_emails_from_uuids)
-        .or(home);
+        .or(home)
+        .or(accept_shared_pass)
+        .or(accept_shared_pass_json)
+        .or(reject_shared_pass)
+        .or(reject_shared_pass_json)
+        .or(get_shared_pass_status)
+        .or(get_shared_pass_status_json);
 
     // Ajout de logs pour les routes
 
@@ -823,8 +1128,57 @@ async fn get_uuids_from_emails_map(emails: Vec<String>, server2: &ServerArc) -> 
     } else {
         Ok(ApiError::BadRequest("Failed to get UUIDs from emails".to_string()).to_response(false))
     }
-
 }
+
+async fn get_shared_pass_status_map(owner: String, pass_id: String, recipient: String, server2: &ServerArc) -> Result<Response, Infallible> {
+    let server = server2.read().await;
+    let owner = match uuid::Uuid::parse_str(&owner) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+    };
+    let pass_id = match uuid::Uuid::parse_str(&pass_id) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+    };
+    let recipient = match uuid::Uuid::parse_str(&recipient) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+    };
+    let status = server.get_shared_pass_status(owner, pass_id, recipient).await;
+    if let Ok(status) = status {
+        Ok(warp::reply::Response::new(bincode::serialize(&status).unwrap().into()))
+    } else {
+        Ok(ApiError::BadRequest("Failed to get shared pass status".to_string()).to_response(false))
+    }
+}
+
+async fn get_shared_pass_status_json_map(owner: String, pass_id: String, recipient: String, server2: &ServerArc) -> Result<Response, Infallible> {
+    let server = server2.read().await;
+    let owner = match uuid::Uuid::parse_str(&owner) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+    };
+    let pass_id = match uuid::Uuid::parse_str(&pass_id) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+    };
+    let recipient = match uuid::Uuid::parse_str(&recipient) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+    };
+    let status = server.get_shared_pass_status(owner, pass_id, recipient).await;
+    if let Ok(status) = status {
+        Ok(warp::reply::json(&status).into_response())  
+    } else {
+        Ok(ApiError::BadRequest("Failed to get shared pass status".to_string()).to_response(true))
+    }
+}
+
+
+
+
+
+
 
 async fn get_emails_from_uuids_map(uuids: Vec<Uuid>, server2: &ServerArc) -> Result<Response, Infallible> {
     let server = server2.read().await;
@@ -860,6 +1214,89 @@ async fn get_shared_by_user_map(owner: String, server2: &ServerArc) -> Result<Re
     }
 }
 
+async fn accept_shared_pass_map(recipient: String, owner: String, pass_id: String, server2: &ServerArc) -> Result<Response, Infallible> {
+    let mut server = server2.write().await;
+    let recipient = match uuid::Uuid::parse_str(&recipient) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+    };
+    let owner = match uuid::Uuid::parse_str(&owner) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+    };
+    let pass_id = match uuid::Uuid::parse_str(&pass_id) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+    };
+    let shared_pass = server.accept_shared_pass(owner, pass_id, recipient).await;
+    if let Err(e) = shared_pass {
+        return Ok(ApiError::BadRequest(e.to_string()).to_response(false));
+    }
+    Ok(warp::reply::Response::new(bincode::serialize(&"OK").unwrap().into()))
+}
+
+async fn accept_shared_pass_json_map(recipient: String, owner: String, pass_id: String, server2: &ServerArc) -> Result<Response, Infallible> {
+    let mut server = server2.write().await;
+    let recipient = match uuid::Uuid::parse_str(&recipient) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+    };
+    let owner = match uuid::Uuid::parse_str(&owner) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+    };
+    let pass_id = match uuid::Uuid::parse_str(&pass_id) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+    };
+    let shared_pass = server.accept_shared_pass(owner, pass_id, recipient).await;
+    if let Err(e) = shared_pass {
+        return Ok(ApiError::BadRequest(e.to_string()).to_response(true));
+    }
+    Ok(warp::reply::json(&"OK").into_response())
+}
+
+async fn reject_shared_pass_map(recipient: String, owner: String, pass_id: String, server2: &ServerArc) -> Result<Response, Infallible> {
+    let mut server = server2.write().await;
+    let recipient = match uuid::Uuid::parse_str(&recipient) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+    };
+    let owner = match uuid::Uuid::parse_str(&owner) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+    };
+    let pass_id = match uuid::Uuid::parse_str(&pass_id) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+    };
+    let shared_pass = server.reject_shared_pass(owner, pass_id, recipient).await;
+    if let Err(e) = shared_pass {
+        return Ok(ApiError::BadRequest(e.to_string()).to_response(false));
+    }
+    Ok(warp::reply::Response::new(bincode::serialize(&"OK").unwrap().into()))
+}
+
+async fn reject_shared_pass_json_map(recipient: String, owner: String, pass_id: String, server2: &ServerArc) -> Result<Response, Infallible> {
+    let mut server = server2.write().await;
+    let recipient = match uuid::Uuid::parse_str(&recipient) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+    };
+    let owner = match uuid::Uuid::parse_str(&owner) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+    };
+    let pass_id = match uuid::Uuid::parse_str(&pass_id) {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+    };
+    let shared_pass = server.reject_shared_pass(owner, pass_id, recipient).await;
+    if let Err(e) = shared_pass {
+        return Ok(ApiError::BadRequest(e.to_string()).to_response(true));
+    }
+    Ok(warp::reply::json(&"OK").into_response())
+}
 
 async fn delete_map(
     uui: String,
@@ -1070,7 +1507,7 @@ async fn verify_json_map(
             };
 
             Ok(warp::reply::with_header(
-                warp::reply::json(&"OK"),
+                warp::reply::json(&token),
                 "set-cookie",
                 format!(
                     "token={}; Path=/; HttpOnly; Max-Age=3600; SameSite=Strict",
