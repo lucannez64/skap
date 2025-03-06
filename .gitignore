@@ -7,6 +7,8 @@ Cargo.lock
 .env
 .env.*
 *.pem
+ca.pem
+ca.key
 *.key
 *.crt
 *.cert
