@@ -50,4 +50,5 @@ LICENSE
 !ca.pem
 *.bak
 *.tmp
+*.key
 *.old 

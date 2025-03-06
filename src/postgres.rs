@@ -140,14 +140,19 @@ impl UsersT for UsersPostgres {
     async fn get_user(&self, id: uuid::Uuid) -> ResultP<crate::protocol::CK> {
         let database = self.database.get().await?;
         let stmt = handle_db_error!(database.prepare_cached(SQL_SELECT_USER).await, "Error preparing get_user statement")?;
-        let row = handle_db_error!(database.query_one(&stmt, &[&id]).await, "Error getting user")?;
         
-        Ok(crate::protocol::CK {
-            email: row.get(0),
-            ky_p: row.get(1),
-            di_p: row.get(2),
-            id: None,
-        })
+        // Utiliser query_opt au lieu de query_one pour gérer le cas où l'utilisateur n'existe pas
+        let row_opt = handle_db_error!(database.query_opt(&stmt, &[&id]).await, "Error getting user")?;
+        
+        match row_opt {
+            Some(row) => Ok(crate::protocol::CK {
+                email: row.get(0),
+                ky_p: row.get(1),
+                di_p: row.get(2),
+                id: None,
+            }),
+            None => Err(ProtocolError::UserNotFound)
+        }
     }
 
     async fn remove_user(&mut self, id: uuid::Uuid) -> ResultP<()> {
@@ -159,14 +164,19 @@ impl UsersT for UsersPostgres {
     async fn get_user_from_email(&self, email: String) -> ResultP<crate::protocol::CK> {
         let database = self.database.get().await?;
         let stmt = handle_db_error!(database.prepare_cached(SQL_SELECT_USER_BY_EMAIL).await, "Error preparing get_user_from_email statement")?;
-        let row = handle_db_error!(database.query_one(&stmt, &[&email]).await, "Error getting user from email")?;
         
-        Ok(crate::protocol::CK {
-            email: row.get(1),
-            ky_p: row.get(2),
-            di_p: row.get(3),
-            id: Some(row.get(0)),
-        })
+        // Utiliser query_opt au lieu de query_one pour gérer le cas où l'email n'existe pas
+        let row_opt = handle_db_error!(database.query_opt(&stmt, &[&email]).await, "Error getting user from email")?;
+        
+        match row_opt {
+            Some(row) => Ok(crate::protocol::CK {
+                email: row.get(1),
+                ky_p: row.get(2),
+                di_p: row.get(3),
+                id: Some(row.get(0)),
+            }),
+            None => Err(ProtocolError::UserNotFound)
+        }
     }
 
     async fn get_uuids_from_emails(&self, emails: Vec<String>) -> ResultP<Vec<Uuid>> {
@@ -186,12 +196,19 @@ impl UsersT for UsersPostgres {
     async fn get_public_key(&self, id: Uuid) -> ResultP<[u8; crate::protocol::KYBER_PUBLICKEYBYTES]> {
         let database = self.database.get().await?;
         let stmt = handle_db_error!(database.prepare_cached(SQL_SELECT_PUBLIC_KEY).await, "Error preparing get_public_key statement")?;
-        let row = handle_db_error!(database.query_one(&stmt, &[&id]).await, "Error getting public key")?;
         
-        let a: Vec<u8> = row.get(0);
-        let mut b = [0u8; crate::protocol::KYBER_PUBLICKEYBYTES];
-        b.copy_from_slice(&a);
-        Ok(b)
+        // Utiliser query_opt au lieu de query_one pour gérer le cas où l'utilisateur n'existe pas
+        let row_opt = handle_db_error!(database.query_opt(&stmt, &[&id]).await, "Error getting public key")?;
+        
+        match row_opt {
+            Some(row) => {
+                let a: Vec<u8> = row.get(0);
+                let mut b = [0u8; crate::protocol::KYBER_PUBLICKEYBYTES];
+                b.copy_from_slice(&a);
+                Ok(b)
+            },
+            None => Err(ProtocolError::UserNotFound)
+        }
     }
 }
 
@@ -219,8 +236,14 @@ impl PassesT for PassesPostgres {
     async fn get_pass(&self, id: uuid::Uuid, pass_id: uuid::Uuid) -> ResultP<Vec<u8>> {
         let database = self.database.get().await?;
         let stmt = handle_db_error!(database.prepare_cached(SQL_SELECT_PASS).await, "Error preparing get_pass statement")?;
-        let row = handle_db_error!(database.query_one(&stmt, &[&id, &pass_id]).await, "Error getting pass")?;
-        Ok(row.get(0))
+        
+        // Utiliser query_opt au lieu de query_one pour gérer le cas où le mot de passe n'existe pas
+        let row_opt = handle_db_error!(database.query_opt(&stmt, &[&id, &pass_id]).await, "Error getting pass")?;
+        
+        match row_opt {
+            Some(row) => Ok(row.get(0)),
+            None => Err(ProtocolError::PassNotFound)
+        }
     }
 
     async fn remove_pass(&mut self, id: uuid::Uuid, pass_id: uuid::Uuid) -> ResultP<()> {
@@ -301,12 +324,17 @@ impl SharedPassesT for SharedPassesPostgres {
             database.prepare_cached(SQL_SELECT_SHARED_PASS).await,
             "Error preparing get_shared_pass statement"
         )?;
-        let row = handle_db_error!(
-            database.query_one(&stmt, &[&owner, &pass_id, &recipient]).await,
+        
+        // Utiliser query_opt au lieu de query_one pour gérer le cas où le mot de passe partagé n'existe pas
+        let row_opt = handle_db_error!(
+            database.query_opt(&stmt, &[&owner, &pass_id, &recipient]).await,
             "Error getting shared pass"
         )?;
 
-        Ok(row.get(0))
+        match row_opt {
+            Some(row) => Ok(row.get(0)),
+            None => Err(ProtocolError::PassNotFound)
+        }
     }
 
     async fn remove_shared_pass(
@@ -342,12 +370,10 @@ impl SharedPassesT for SharedPassesPostgres {
             database.query(&stmt, &[&recipient]).await,
             "Error getting all shared passes"
         )?;
-
         let mut result = Vec::with_capacity(rows.len());
         for row in rows {
             result.push((row.get(0), row.get(1), row.get(2)));
         }
-
         Ok(result)
     }
 

@@ -1,6 +1,7 @@
 use crate::postgres::PassesPostgres;
 use crate::postgres::SharedPassesPostgres;
 use crate::postgres::UsersPostgres;
+use crate::protocol::ProtocolError;
 use crate::protocol::SharedPass;
 use crate::protocol::SharedByUser;
 use uuid::Uuid;
@@ -1387,6 +1388,11 @@ async fn challenge_map(uui: String, server2: &ServerArc) -> Result<Response, Inf
                 )
             }
         },
+        Err(ProtocolError::UserNotFound) => {
+            return Ok(
+                ApiError::BadRequest("User not found".to_string()).to_response(false),
+            )
+        }
         Err(_) => {
             Ok(ApiError::InternalError("Failed to generate challenge".to_string()).to_response(false))
         }
@@ -1403,6 +1409,11 @@ async fn challenge_json_map(uui: String, server2: &ServerArc) -> Result<Response
 
     match server.challenge(id).await {
         Ok(challenge) => Ok(warp::reply::json(&challenge).into_response()),
+        Err(ProtocolError::UserNotFound) => {
+            return Ok(
+                ApiError::BadRequest("User not found".to_string()).to_response(true),
+            )
+        }
         Err(_) => Ok(ApiError::InternalError("Failed to generate challenge".to_string()).to_response(true)),
     }
 }
@@ -1594,6 +1605,16 @@ async fn send_map(uui: String, uui2: String, server2: &ServerArc) -> Result<Resp
         Ok(r) => {
             Ok(warp::reply::Response::new(bincode::serialize(&r).unwrap().into()).into_response())
         }
+        Err(ProtocolError::UserNotFound) => {
+            return Ok(
+                ApiError::BadRequest("User not found".to_string()).to_response(false),
+            )
+        }
+        Err(ProtocolError::PassNotFound) => {
+            return Ok(
+                ApiError::BadRequest("Pass not found".to_string()).to_response(false),
+            )
+        }
         Err(_) => Ok(ApiError::InternalError("Failed to send pass".to_string()).into()),
     }
 }
@@ -1621,6 +1642,16 @@ async fn send_json_map(
 
     match server.send(id, id2).await {
         Ok(r) => Ok(warp::reply::json(&r).into_response()),
+        Err(ProtocolError::UserNotFound) => {
+            return Ok(
+                ApiError::BadRequest("User not found".to_string()).to_response(true),
+            )
+        }
+        Err(ProtocolError::PassNotFound) => {
+            return Ok(
+                ApiError::BadRequest("Pass not found".to_string()).to_response(true),
+            )
+        }
         Err(_) => Ok(ApiError::InternalError("Failed to send pass".to_string()).to_response(true)),
     }
 }

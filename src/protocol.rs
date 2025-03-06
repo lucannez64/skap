@@ -53,6 +53,10 @@ pub enum ProtocolError {
     DataError,
     #[error("Storage Error")]
     StorageError,
+    #[error("User not found")]
+    UserNotFound,
+    #[error("Password not found")]
+    PassNotFound,
 }
 
 pub type ResultP<T> = std::result::Result<T, ProtocolError>;

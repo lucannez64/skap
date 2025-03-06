@@ -3,16 +3,16 @@ services:
   ca-generator:
     image: alpine:latest
     command: >
-      sh -c "
+      sh -c '
         if [ ! -f /certs/ca.pem ]; then
-          echo 'Génération du certificat CA...'
+          echo "Génération du certificat CA..."
           apk add --no-cache openssl
-          openssl req -x509 -newkey rsa:4096 -keyout /certs/ca.key -out /certs/ca.pem -days 3650 -nodes -subj '/CN=skap-postgres/O=Skap/C=FR' -addext 'subjectAltName=DNS:postgres,DNS:localhost,IP:127.0.0.1'
-          echo 'Certificat CA généré avec succès.'
+          openssl req -x509 -newkey rsa:4096 -keyout /certs/ca.key -out /certs/ca.pem -days 3650 -nodes -subj "/CN=skap-postgres/O=Skap/C=FR" -addext "subjectAltName=DNS:postgres,DNS:localhost,IP:127.0.0.1"
+          echo "Certificat CA généré avec succès."
         else
-          echo 'Le certificat CA existe déjà.'
+          echo "Le certificat CA existe déjà."
         fi
-      "
+      '
     volumes:
       - ca-cert:/certs:rw
     networks:
@@ -57,6 +57,27 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      
+  # Service Skap Server
+  skap-server:
+    image: hirew/skap-server:latest
+    ports:
+      - "3030:3030"
+    environment:
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/skap
+      - REDIS_URL=redis://redis:6379
+      - BASE64_KEY=Cnq094AgzRxApmXC5vjCMzVncq42Ihm6fS7diRYhKqQ=
+    volumes:
+      - ca-cert:/app/certs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - skap-network
+    command: ["/app/skap-server"]
   
 volumes:
   postgres-data:
