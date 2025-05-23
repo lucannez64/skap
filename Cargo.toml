@@ -72,3 +72,16 @@ chrono = "0.4.40"
 zeroize = { version = "1.8.1", features = ["simd"] }
 once_cell = "1.20.3"
 serde_repr = "0.1.19"
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json", "cookies"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde_json = "1.0"
+bincode = "1.3"
+# pasetors is already a main dependency, but listing it here for clarity of test needs
+# skap = { path = ".", features = ["server"] } # No, this creates a circular dependency if skap is a library.
+                                            # If skap is a binary, tests can typically access its items via `use ::skap::module;`
+                                            # For integration tests, we often compile the main crate as a library first.
+                                            # However, given the setup, it might be simpler to just use the items directly if the crate structure allows.
+                                            # Let's assume for now that `use skap::server;` etc. will work if `main.rs` or `lib.rs` is structured correctly.
+                                            # If not, this might need adjustment.

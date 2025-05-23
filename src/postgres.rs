@@ -29,6 +29,7 @@ static SQL_SELECT_ALL_SHARED_PASSES: &str = "SELECT data, pass_id, owner_id FROM
 static SQL_SELECT_SHARED_BY_USER: &str = "SELECT pass_id, recipient_id FROM shared_passes WHERE owner_id = $1";
 static SQL_SELECT_SHARED_BY_USER_AND_PASS: &str = "SELECT recipient_id FROM shared_passes WHERE owner_id = $1 AND pass_id = $2";
 static SQL_UPDATE_SHARED_PASS: &str = "UPDATE shared_passes SET data = $4 WHERE owner_id = $1 AND pass_id = $2 AND recipient_id = $3";
+static SQL_UPSERT_SHARED_PASS: &str = "INSERT INTO shared_passes (owner_id, pass_id, recipient_id, data) VALUES ($1, $2, $3, $4) ON CONFLICT (owner_id, pass_id, recipient_id) DO UPDATE SET data = EXCLUDED.data";
 // Macro pour gérer les erreurs de base de données de manière cohérente
 macro_rules! handle_db_error {
     ($result:expr, $error_msg:expr) => {
@@ -293,23 +294,14 @@ impl SharedPassesT for SharedPassesPostgres {
         shared_pass: Vec<u8>,
     ) -> ResultP<()> {
         let database = self.database.get().await?;
-        if let Ok(_) = self.get_shared_pass(recipient, owner, pass_id).await {
-            let stmt = handle_db_error!(
-                database.prepare_cached(SQL_UPDATE_SHARED_PASS).await,
-                "Error preparing update_shared_pass statement"
-            )?;
-            handle_db_error!(database.execute(&stmt, &[&owner, &pass_id, &recipient, &shared_pass]).await, "Error updating existing shared pass")?;
-        } else {
-            let stmt = handle_db_error!(
-                database.prepare_cached(SQL_INSERT_SHARED_PASS).await,
-                "Error preparing store_shared_pass statement"
-            )?;
-
-            handle_db_error!(
-                database.execute(&stmt, &[&owner, &pass_id, &recipient, &shared_pass]).await,
-                "Error storing shared pass"
-            )?;
-        }
+        let stmt = handle_db_error!(
+            database.prepare_cached(SQL_UPSERT_SHARED_PASS).await,
+            "Error preparing upsert_shared_pass statement"
+        )?;
+        handle_db_error!(
+            database.execute(&stmt, &[&owner, &pass_id, &recipient, &shared_pass]).await,
+            "Error upserting shared pass"
+        )?;
         Ok(())
     }
 
