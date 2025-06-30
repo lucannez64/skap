@@ -9,7 +9,7 @@ pub async fn new(client2: &reqwest::Client, email: &str) -> ResultP<(Client, CK)
     let client = crate::protocol::Client::new()?;
     let ck = CK::new(client.ky_p, client.di_p.clone(), email.to_string());
     
-    let serialized_ck = bincode::serialize(&ck)
+    let serialized_ck = bincode::serde::encode_to_vec(&ck, bincode::config::legacy())
         .map_err(|_| ProtocolError::DataError)?;
     
     let res = client2
@@ -23,8 +23,8 @@ pub async fn new(client2: &reqwest::Client, email: &str) -> ResultP<(Client, CK)
         .await
         .map_err(|_| ProtocolError::DataError)?;
     
-    let deserialized_ck = bincode::deserialize::<CK>(&bytes)
-        .map_err(|_| ProtocolError::DataError)?;
+    let deserialized_ck = bincode::serde::decode_from_slice::<CK>(&bytes, bincode::config::legacy())
+        .map_err(|_| ProtocolError::DataError)?.0;
     
     Ok((client, deserialized_ck))
 }
@@ -50,7 +50,7 @@ pub async fn auth(
     let sign = client.sign(&chall);
     
     // Vérifier la signature
-    let serialized_sign = bincode::serialize(sign.as_slice())
+    let serialized_sign = bincode::serde::encode_to_vec(sign.as_slice(), bincode::config::legacy())
         .map_err(|_| ProtocolError::DataError)?;
     
     let res = client2
@@ -85,8 +85,8 @@ pub async fn auth(
         .await
         .map_err(|_| ProtocolError::DataError)?;
     
-    let dd = bincode::deserialize::<&[u8]>(&d)
-        .map_err(|_| ProtocolError::DataError)?;
+    let dd = bincode::serde::decode_from_slice::<&[u8]>(&d, bincode::config::legacy())
+        .map_err(|_| ProtocolError::DataError)?.0;
     
     client.sync(dd)?;
     
@@ -113,7 +113,7 @@ pub async fn create_pass(
     
     let cookie = format!("token={}", cookies[0].value().replace("\"", ""));
     
-    let serialized_eq = bincode::serialize(&eq)
+    let serialized_eq = bincode::serde::encode_to_vec(&eq, bincode::config::legacy())
         .map_err(|_| ProtocolError::DataError)?;
     
     let res = client2
@@ -129,8 +129,8 @@ pub async fn create_pass(
         .await
         .map_err(|_| ProtocolError::DataError)?;
     
-    bincode::deserialize::<Uuid>(&bytes)
-        .map_err(|_| ProtocolError::DataError)
+    bincode::serde::decode_from_slice::<Uuid>(&bytes, bincode::config::legacy())
+        .map_err(|_| ProtocolError::DataError).map(|(result, _)| result)
 }
 
 pub async fn update_pass(
@@ -154,7 +154,7 @@ pub async fn update_pass(
     
     let cookie = format!("token={}", cookies[0].value().replace("\"", ""));
     
-    let serialized_eq = bincode::serialize(&eq)
+    let serialized_eq = bincode::serde::encode_to_vec(&eq, bincode::config::legacy())
         .map_err(|_| ProtocolError::DataError)?;
     
     let res = client2
@@ -177,8 +177,8 @@ pub async fn update_pass(
         .await
         .map_err(|_| ProtocolError::DataError)?;
     
-    bincode::deserialize::<Uuid>(&bytes)
-        .map_err(|_| ProtocolError::DataError)
+    bincode::serde::decode_from_slice::<Uuid>(&bytes, bincode::config::legacy())
+        .map_err(|_| ProtocolError::DataError).map(|(result, _)| result)
 }
 
 pub async fn get_all(
@@ -212,8 +212,8 @@ pub async fn get_all(
         .map_err(|_| ProtocolError::DataError)?;
 
     let mut owned_passwords: Vec<(Password, Uuid)> = Vec::new();
-    let da = bincode::deserialize::<Vec<(EP, Uuid)>>(&d)
-        .map_err(|_| ProtocolError::DataError)?;
+    let da = bincode::serde::decode_from_slice::<Vec<(EP, Uuid)>>(&d, bincode::config::legacy())
+        .map_err(|_| ProtocolError::DataError)?.0;
     
     for g in da.iter() {
         let p = client.receive(g.0.clone())?;
@@ -233,8 +233,8 @@ pub async fn get_all(
         .map_err(|_| ProtocolError::DataError)?;
 
     let mut shared_passwords: Vec<(Password, Uuid, Uuid)> = Vec::new();
-    let shared_data = bincode::deserialize::<Vec<(SharedPass, Uuid, Uuid)>>(&d)
-        .map_err(|_| ProtocolError::DataError)?;
+    let shared_data = bincode::serde::decode_from_slice::<Vec<(SharedPass, Uuid, Uuid)>>(&d, bincode::config::legacy())
+        .map_err(|_| ProtocolError::DataError)?.0;
     
     for (shared_pass, owner_id, pass_id) in shared_data {
         let password = client.decrypt_shared(shared_pass)?;
@@ -279,8 +279,8 @@ pub async fn delete_pass(
         .await
         .map_err(|_| ProtocolError::DataError)?;
     
-    let response = bincode::deserialize::<String>(&bytes)
-        .map_err(|_| ProtocolError::DataError)?;
+    let response = bincode::serde::decode_from_slice::<String>(&bytes, bincode::config::legacy())
+        .map_err(|_| ProtocolError::DataError)?.0;
     
     match response.as_str() {
         "OK" => Ok(()),
@@ -317,12 +317,12 @@ pub async fn share_pass(
                 + "/",
         )
         .header(COOKIE, HeaderValue::from_str(cookie.as_str()).unwrap())
-        .body(bincode::serialize(&shared_pass).map_err(|_| ProtocolError::DataError)?)
+        .body(bincode::serde::encode_to_vec(&shared_pass, bincode::config::legacy()).map_err(|_| ProtocolError::DataError)?)
         .send()
         .await
         .map_err(|_| ProtocolError::DataError)?;
 
-    let response = bincode::deserialize::<String>(&res.bytes().await.map_err(|_| ProtocolError::DataError)?).map_err(|_| ProtocolError::DataError)?;
+    let response = bincode::serde::decode_from_slice::<String>(&res.bytes().await.map_err(|_| ProtocolError::DataError)?, bincode::config::legacy()).map_err(|_| ProtocolError::DataError)?.0;
     match response.as_str() {
         "Password shared successfully" => Ok(()),
         _ => Err(ProtocolError::DataError),
@@ -356,7 +356,7 @@ pub async fn unshare_pass(
         .await
         .map_err(|_| ProtocolError::DataError)?;
 
-    let response = bincode::deserialize::<String>(&res.bytes().await.map_err(|_| ProtocolError::DataError)?).map_err(|_| ProtocolError::DataError)?;
+    let response = bincode::serde::decode_from_slice::<String>(&res.bytes().await.map_err(|_| ProtocolError::DataError)?, bincode::config::legacy()).map_err(|_| ProtocolError::DataError)?.0;
     match response.as_str() {
         "Password unshared successfully" => Ok(()),
         _ => Err(ProtocolError::DataError),
@@ -391,9 +391,9 @@ pub async fn get_shared_pass(
         .await
         .map_err(|_| ProtocolError::DataError)?;
 
-    let shared_pass = bincode::deserialize::<SharedPass>(
-        &res.bytes().await.map_err(|_| ProtocolError::DataError)?
-    ).map_err(|_| ProtocolError::DataError)?;
+    let shared_pass = bincode::serde::decode_from_slice::<SharedPass>(
+        &res.bytes().await.map_err(|_| ProtocolError::DataError)?, bincode::config::legacy()
+    ).map_err(|_| ProtocolError::DataError)?.0;
 
     // Decrypt the shared password
     client.decrypt_shared(shared_pass)

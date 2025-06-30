@@ -621,8 +621,8 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         let shared_data = self.shared_passes.get_all_shared_passes(recipient).await?;
         
         for (data, owner_id, pass_id) in shared_data {
-            let shared_pass = bincode::deserialize(&data)
-                .map_err(|_| ProtocolError::DataError)?;
+            let shared_pass = bincode::serde::decode_from_slice(&data, bincode::config::legacy())
+                .map_err(|_| ProtocolError::DataError)?.0;
             shared_passes.push((shared_pass, owner_id, pass_id));
         }
         
@@ -682,7 +682,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
             let cipher = XChaCha20Poly1305::new(key);
             let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
             let pass = self.passes.get_pass(id, pass_id).await?;
-            let passs: EP = bincode::deserialize(&pass).unwrap();
+            let passs: EP = bincode::serde::decode_from_slice(&pass, bincode::config::legacy()).unwrap().0;
             let ciphertext = cipher
                 .encrypt(&nonce, passs.ciphertext.as_slice())
                 .map_err(|_| ProtocolError::CryptoError)?;
@@ -712,7 +712,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         let results = passes
             .into_iter()
             .map(|(pass_data, pass_id)| {
-                let pass: EP = bincode::deserialize(&pass_data).unwrap();
+                let pass: EP = bincode::serde::decode_from_slice(&pass_data, bincode::config::legacy()).unwrap().0;
                 let ciphertext = cipher
                     .encrypt(&nonce, pass.ciphertext.as_slice())
                     .map_err(|_| ProtocolError::CryptoError);
@@ -758,7 +758,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
             nonce: pass.nonce,
             nonce2: None,
         };
-        let bi = bincode::serialize(&ep).map_err(|_| ProtocolError::DataError)?;
+        let bi = bincode::serde::encode_to_vec(&ep, bincode::config::legacy()).map_err(|_| ProtocolError::DataError)?;
         self.passes.add_pass(id, id2, bi).await?;
         Ok(id2)
     }
@@ -782,7 +782,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
             nonce: pass.nonce,
             nonce2: None,
         };
-        let bi = bincode::serialize(&ep).map_err(|_| ProtocolError::DataError)?;
+        let bi = bincode::serde::encode_to_vec(&ep, bincode::config::legacy()).map_err(|_| ProtocolError::DataError)?;
         self.passes.update_pass(id, passid, bi).await?;
         Ok(())
     }
@@ -809,12 +809,12 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         // Sérialiser le mot de passe partagé
         let mut shared_pass2 = shared_pass.clone();
         if let Ok(a) = self.shared_passes.get_shared_pass(recipient, owner, pass_id).await {
-            let shared_pass3: SharedPass = bincode::deserialize(&a).unwrap();
+            let shared_pass3: SharedPass = bincode::serde::decode_from_slice(&a, bincode::config::legacy()).unwrap().0;
             shared_pass2.status = shared_pass3.status;
         } else {
             shared_pass2.status = ShareStatus::Pending;
         }
-        let shared_serialized = bincode::serialize(&shared_pass2)
+        let shared_serialized = bincode::serde::encode_to_vec(&shared_pass2, bincode::config::legacy())
             .map_err(|_| ProtocolError::DataError)?;
             
         // Stocker dans la base de données
@@ -845,7 +845,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         let shared_data = self.shared_passes
             .get_shared_pass(recipient, owner, pass_id)
             .await?;
-        bincode::deserialize(&shared_data)
+        bincode::serde::decode_from_slice(&shared_data, bincode::config::legacy()).map(|(result, _)| result)
             .map_err(|_| ProtocolError::DataError)
     }
 
@@ -865,7 +865,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
     ) -> ResultP<()> {
         let mut shared_pass = self.get_shared_pass(recipient, owner, pass_id).await?;
         shared_pass.status = ShareStatus::Accepted;
-        let shared_serialized = bincode::serialize(&shared_pass)
+        let shared_serialized = bincode::serde::encode_to_vec(&shared_pass, bincode::config::legacy())
             .map_err(|_| ProtocolError::DataError)?;
         self.shared_passes.store_shared_pass(owner, pass_id, recipient, shared_serialized).await?;
         Ok(())
@@ -880,8 +880,8 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         let shared_data = self.shared_passes
             .get_shared_pass(recipient, owner, pass_id)
             .await?;
-        let shared_pass: SharedPass = bincode::deserialize(&shared_data)
-            .map_err(|_| ProtocolError::DataError)?;
+        let shared_pass: SharedPass = bincode::serde::decode_from_slice(&shared_data, bincode::config::legacy())
+            .map_err(|_| ProtocolError::DataError)?.0;
         Ok(shared_pass.status)
     }
     
@@ -894,7 +894,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
     ) -> ResultP<()> {
         let mut shared_pass = self.get_shared_pass(recipient, owner, pass_id).await?;
         shared_pass.status = ShareStatus::Rejected;
-        let shared_serialized = bincode::serialize(&shared_pass)
+        let shared_serialized = bincode::serde::encode_to_vec(&shared_pass, bincode::config::legacy())
             .map_err(|_| ProtocolError::DataError)?;
         self.shared_passes.store_shared_pass(owner, pass_id, recipient, shared_serialized).await?;
         Ok(())
@@ -978,14 +978,14 @@ impl ClientEx {
     }
 
     pub fn to_string(&self) -> String {
-        let a = bincode::serialize(&self)
+        let a = bincode::serde::encode_to_vec(&self, bincode::config::legacy())
             .map_err(|_| ProtocolError::DataError)
             .unwrap();
         base64::engine::general_purpose::STANDARD_NO_PAD.encode(a)
     }
 
     pub fn to_file(&self, file_name: String) -> ResultP<()> {
-        let a = bincode::serialize(&self)
+        let a = bincode::serde::encode_to_vec(&self, bincode::config::legacy())
             .map_err(|_| ProtocolError::DataError)
             .unwrap();
         let mut file = std::fs::File::create(file_name)
@@ -1005,9 +1005,8 @@ impl ClientEx {
         file.read_to_end(&mut a)
             .map_err(|_| ProtocolError::DataError)
             .unwrap();
-        let c = bincode::deserialize(&a)
-            .map_err(|_| ProtocolError::DataError)
-            .unwrap();
+        let c = bincode::serde::decode_from_slice(&a, bincode::config::legacy())
+            .map_err(|_| ProtocolError::DataError)?.0;
         Ok(c)
     }
 }
@@ -1031,7 +1030,7 @@ impl Client {
     }
 
     pub fn encrypt(&self, pass: Password) -> ResultP<EP> {
-        let passb = bincode::serialize(&pass).map_err(|_| ProtocolError::DataError)?;
+        let passb = bincode::serde::encode_to_vec(&pass, bincode::config::legacy()).map_err(|_| ProtocolError::DataError)?;
         let hash = hash(&self.ky_q);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
@@ -1088,7 +1087,7 @@ impl Client {
         let pass = cipher
             .decrypt(XNonce::from_slice(&ep.nonce), ep.ciphertext.as_slice())
             .map_err(|_| ProtocolError::CryptoError)?;
-        let pass: Password = bincode::deserialize(&pass).map_err(|_| ProtocolError::DataError)?;
+        let pass: Password = bincode::serde::decode_from_slice(&pass, bincode::config::legacy()).map_err(|_| ProtocolError::DataError)?.0;
         Ok(pass)
     }
 
@@ -1128,7 +1127,7 @@ impl Client {
         let shared_nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
 
         // Chiffrer le mot de passe
-        let password_ser = bincode::serialize(&raw_password)
+        let password_ser = bincode::serde::encode_to_vec(&raw_password, bincode::config::legacy())
             .map_err(|_| ProtocolError::DataError)?;
         let shared_ct = shared_cipher
             .encrypt(&shared_nonce, password_ser.as_slice())
@@ -1169,7 +1168,7 @@ impl Client {
             .decrypt(nonce, shared_pass.ep.ciphertext.as_slice())
             .map_err(|_| ProtocolError::CryptoError)?;
 
-        bincode::deserialize(&decrypted_bytes)
+        bincode::serde::decode_from_slice(&decrypted_bytes, bincode::config::legacy()).map(|(result, _)| result)
             .map_err(|_| ProtocolError::DataError)
     }
 }
