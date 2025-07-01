@@ -5,9 +5,12 @@ use dashmap::DashMap;
 use governor::state::InMemoryState;
 use governor::{Quota, RateLimiter};
 use log::{error, info, warn};
+use rand;
+use redis::{Client, RedisError};
+use std::env;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 use warp::{Filter, Rejection, Reply};
@@ -43,9 +46,12 @@ pub struct SecurityManager {
 
     // Audit logging
     audit_events: Arc<RwLock<Vec<AuditEvent>>>,
+
+    // Redis client for persistent storage
+    redis_client: Option<Arc<Client>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AuditEvent {
     pub timestamp: SystemTime,
     pub event_type: AuditEventType,
@@ -55,7 +61,7 @@ pub struct AuditEvent {
     pub success: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum AuditEventType {
     Login,
     Logout,
@@ -78,17 +84,97 @@ impl SecurityManager {
         let general_limiter = Arc::new(RateLimiter::dashmap(general_quota));
         let login_limiter = Arc::new(RateLimiter::dashmap(login_quota));
 
+        // Initialize Redis client for persistent storage
+        let redis_client = Self::init_redis_client();
+
         Self {
             general_limiter,
             login_limiter,
             active_sessions: Arc::new(DashMap::new()),
             user_sessions: Arc::new(DashMap::new()),
             audit_events: Arc::new(RwLock::new(Vec::new())),
+            redis_client,
         }
+    }
+
+    fn init_redis_client() -> Option<Arc<Client>> {
+        if let Ok(redis_url) = env::var("REDIS_URL") {
+            let use_tls = env::var("REDIS_TLS_ENABLED")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse::<bool>()
+                .unwrap_or(false);
+
+            let client_url = if use_tls && redis_url.starts_with("redis://") {
+                redis_url.replace("redis://", "rediss://")
+            } else {
+                redis_url
+            };
+
+            match Client::open(client_url.as_str()) {
+                Ok(client) => {
+                    // Test connection and authenticate
+                    if let Ok(mut con) = client.get_connection() {
+                        if let Ok(redis_password) = env::var("REDIS_PASSWORD") {
+                            if !redis_password.is_empty() {
+                                if redis::cmd("AUTH")
+                                    .arg(&redis_password)
+                                    .query::<String>(&mut con)
+                                    .is_ok()
+                                {
+                                    if redis::cmd("PING").query::<String>(&mut con).is_ok() {
+                                        info!("Redis client initialized successfully for security manager");
+                                        return Some(Arc::new(client));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    warn!("Failed to authenticate with Redis for security manager");
+                }
+                Err(e) => {
+                    warn!("Failed to create Redis client for security manager: {}", e);
+                }
+            }
+        }
+        None
     }
 
     // Rate limiting methods
     pub async fn check_general_rate_limit(&self, ip: IpAddr) -> Result<(), SecurityError> {
+        // Try Redis-backed rate limiting first, fallback to in-memory
+        if let Some(redis_client) = &self.redis_client {
+            match self
+                .check_redis_rate_limit(
+                    redis_client,
+                    &ip,
+                    "general",
+                    60,
+                    MAX_REQUESTS_PER_MINUTE as u32,
+                )
+                .await
+            {
+                Ok(allowed) => {
+                    if !allowed {
+                        self.log_audit_event(AuditEvent {
+                            timestamp: SystemTime::now(),
+                            event_type: AuditEventType::RateLimitExceeded,
+                            user_id: None,
+                            ip_address: Some(ip),
+                            details: "General rate limit exceeded (Redis)".to_string(),
+                            success: false,
+                        })
+                        .await;
+                        return Err(SecurityError::RateLimitExceeded);
+                    }
+                    return Ok(());
+                }
+                Err(_) => {
+                    warn!("Redis rate limiting failed, falling back to in-memory");
+                }
+            }
+        }
+
+        // Fallback to in-memory rate limiting
         match self.general_limiter.check_key(&ip) {
             Ok(_) => Ok(()),
             Err(_) => {
@@ -107,6 +193,40 @@ impl SecurityManager {
     }
 
     pub async fn check_login_rate_limit(&self, ip: IpAddr) -> Result<(), SecurityError> {
+        // Try Redis-backed rate limiting first, fallback to in-memory
+        if let Some(redis_client) = &self.redis_client {
+            match self
+                .check_redis_rate_limit(
+                    redis_client,
+                    &ip,
+                    "login",
+                    3600,
+                    MAX_LOGIN_ATTEMPTS_PER_HOUR as u32,
+                )
+                .await
+            {
+                Ok(allowed) => {
+                    if !allowed {
+                        self.log_audit_event(AuditEvent {
+                            timestamp: SystemTime::now(),
+                            event_type: AuditEventType::RateLimitExceeded,
+                            user_id: None,
+                            ip_address: Some(ip),
+                            details: "Login rate limit exceeded (Redis)".to_string(),
+                            success: false,
+                        })
+                        .await;
+                        return Err(SecurityError::LoginRateLimitExceeded);
+                    }
+                    return Ok(());
+                }
+                Err(_) => {
+                    warn!("Redis login rate limiting failed, falling back to in-memory");
+                }
+            }
+        }
+
+        // Fallback to in-memory rate limiting
         match self.login_limiter.check_key(&ip) {
             Ok(_) => Ok(()),
             Err(_) => {
@@ -121,6 +241,57 @@ impl SecurityManager {
                 .await;
                 Err(SecurityError::LoginRateLimitExceeded)
             }
+        }
+    }
+
+    // Redis-backed rate limiting implementation
+    async fn check_redis_rate_limit(
+        &self,
+        redis_client: &Arc<Client>,
+        ip: &IpAddr,
+        limit_type: &str,
+        window_seconds: u64,
+        max_requests: u32,
+    ) -> Result<bool, RedisError> {
+        let mut con = redis_client.get_connection()?;
+
+        // Authenticate if password is set
+        if let Ok(redis_password) = env::var("REDIS_PASSWORD") {
+            if !redis_password.is_empty() {
+                redis::cmd("AUTH")
+                    .arg(&redis_password)
+                    .query::<String>(&mut con)?;
+            }
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let window_start = now - window_seconds;
+        let key = format!("rate_limit:{}:{}", limit_type, ip);
+
+        // Use Redis sorted set for sliding window rate limiting
+        let mut pipe = redis::pipe();
+        pipe.atomic()
+            // Remove old entries
+            .cmd("ZREMRANGEBYSCORE")
+            .arg(&key)
+            .arg(0)
+            .arg(window_start as f64)
+            // Count current entries
+            .zcard(&key)
+            // Add current request
+            .zadd(&key, now as f64, now)
+            // Set expiration
+            .expire(&key, window_seconds as i64 + 1);
+
+        let results: Vec<redis::Value> = pipe.query(&mut con)?;
+
+        if let Some(redis::Value::Int(count)) = results.get(1) {
+            Ok(*count < max_requests as i64)
+        } else {
+            Ok(true) // Allow on error
         }
     }
 
@@ -268,8 +439,6 @@ impl SecurityManager {
 
     // Audit logging methods
     pub async fn log_audit_event(&self, event: AuditEvent) {
-        let mut events = self.audit_events.write().await;
-
         // Log to application logger
         match event.event_type {
             AuditEventType::Login => {
@@ -301,19 +470,127 @@ impl SecurityManager {
             }
         }
 
+        // Store in Redis if available
+        if let Some(redis_client) = &self.redis_client {
+            if let Err(e) = self.store_audit_event_redis(redis_client, &event).await {
+                warn!("Failed to store audit event in Redis: {}", e);
+            }
+        }
+
+        // Store in memory as backup
+        let mut events = self.audit_events.write().await;
         events.push(event);
 
-        // Keep only last 10000 events to prevent memory issues
-        if events.len() > 10000 {
-            events.drain(0..1000);
+        // Keep only last 1000 events in memory to prevent memory issues
+        if events.len() > 1000 {
+            events.drain(0..100);
         }
     }
 
+    async fn store_audit_event_redis(
+        &self,
+        redis_client: &Arc<Client>,
+        event: &AuditEvent,
+    ) -> Result<(), RedisError> {
+        let mut con = redis_client.get_connection()?;
+
+        // Authenticate if password is set
+        if let Ok(redis_password) = env::var("REDIS_PASSWORD") {
+            if !redis_password.is_empty() {
+                redis::cmd("AUTH")
+                    .arg(&redis_password)
+                    .query::<String>(&mut con)?;
+            }
+        }
+
+        let timestamp = event
+            .timestamp
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let event_json = serde_json::to_string(event).map_err(|_| {
+            RedisError::from((
+                redis::ErrorKind::TypeError,
+                "Failed to serialize audit event",
+            ))
+        })?;
+
+        // Store in sorted set with timestamp as score for chronological ordering
+        let key = "audit_events";
+        redis::cmd("ZADD")
+            .arg(key)
+            .arg(timestamp as f64)
+            .arg(&event_json)
+            .query::<()>(&mut con)?;
+
+        // Keep only last 100,000 events in Redis (about 30 days of typical usage)
+        let count: i64 = redis::cmd("ZCARD").arg(key).query(&mut con)?;
+        if count > 100000 {
+            redis::cmd("ZREMRANGEBYRANK")
+                .arg(key)
+                .arg(0)
+                .arg(count - 100000 - 1)
+                .query::<()>(&mut con)?;
+        }
+
+        Ok(())
+    }
+
     pub async fn get_audit_events(&self, limit: Option<usize>) -> Vec<AuditEvent> {
-        let events = self.audit_events.read().await;
         let limit = limit.unwrap_or(100);
 
+        // Try to get events from Redis first
+        if let Some(redis_client) = &self.redis_client {
+            if let Ok(redis_events) = self.get_audit_events_from_redis(redis_client, limit).await {
+                if !redis_events.is_empty() {
+                    return redis_events;
+                }
+            }
+        }
+
+        // Fallback to in-memory events
+        let events = self.audit_events.read().await;
         events.iter().rev().take(limit).cloned().collect()
+    }
+
+    async fn get_audit_events_from_redis(
+        &self,
+        redis_client: &Arc<Client>,
+        limit: usize,
+    ) -> Result<Vec<AuditEvent>, RedisError> {
+        let mut con = redis_client.get_connection()?;
+
+        // Authenticate if password is set
+        if let Ok(redis_password) = env::var("REDIS_PASSWORD") {
+            if !redis_password.is_empty() {
+                redis::cmd("AUTH")
+                    .arg(&redis_password)
+                    .query::<String>(&mut con)?;
+            }
+        }
+
+        // Get latest events (highest scores first)
+        let event_strings: Vec<String> = redis::cmd("ZREVRANGE")
+            .arg("audit_events")
+            .arg(0)
+            .arg(limit as i64 - 1)
+            .query(&mut con)?;
+
+        let mut events = Vec::new();
+        for event_str in event_strings {
+            if let Ok(event) = serde_json::from_str::<AuditEvent>(&event_str) {
+                events.push(event);
+            }
+        }
+
+        Ok(events)
+    }
+
+    // Error response timing to prevent timing attacks
+    pub async fn add_error_response_delay(&self) {
+        // Add a small random delay (50-150ms) to prevent timing attacks
+        let delay_ms = 50 + (rand::random::<u64>() % 100);
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 
     // Security metrics
@@ -390,8 +667,12 @@ impl warp::reject::Reject for RateLimitRejection {}
 pub struct LoginRateLimitRejection;
 impl warp::reject::Reject for LoginRateLimitRejection {}
 
-// Rejection handler
+// Rejection handler with error response timing
 pub async fn handle_rejections(err: Rejection) -> Result<impl Reply, std::convert::Infallible> {
+    // Add timing delay for security errors to prevent timing attacks
+    let delay_ms = 50 + (rand::random::<u64>() % 100);
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
     if err.find::<RateLimitRejection>().is_some() {
         Ok(warp::reply::with_status(
             warp::reply::json(&serde_json::json!({

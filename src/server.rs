@@ -288,6 +288,7 @@ async fn generate_new_token(
 
 async fn auth_validation(
     sk: Arc<RwLock<SymmetricKey<V4>>>,
+    security_manager: &Arc<SecurityManager>,
     uuid: &str,
     token: Option<String>,
     is_json: bool,
@@ -295,6 +296,8 @@ async fn auth_validation(
     if let Some(token) = token {
         // Check if token is blacklisted
         if is_token_blacklisted(&token).await {
+            // Add error response timing
+            security_manager.add_error_response_delay().await;
             return Err(
                 ApiError::Unauthorized("Token has been revoked".to_string()).to_response(is_json)
             );
@@ -303,25 +306,50 @@ async fn auth_validation(
         let sk = sk.read().await;
         let validation = ClaimsValidationRules::new();
         let untrusted_token = UntrustedToken::<Local, V4>::try_from(&token).map_err(|_| {
+            // Add error response timing for invalid token format
+            let sm = security_manager.clone();
+            tokio::spawn(async move {
+                sm.add_error_response_delay().await;
+            });
             ApiError::Unauthorized("Invalid token format".to_string()).to_response(is_json)
         })?;
 
         let trusted_token = local::decrypt(&sk, &untrusted_token, &validation, None, Some(b"skap"))
             .map_err(|_| {
+                // Add error response timing for token validation failure
+                let sm = security_manager.clone();
+                tokio::spawn(async move {
+                    sm.add_error_response_delay().await;
+                });
                 ApiError::Unauthorized("Token validation failed".to_string()).to_response(is_json)
             })?;
 
         let claims = trusted_token.payload_claims().ok_or_else(|| {
+            // Add error response timing for missing claims
+            let sm = security_manager.clone();
+            tokio::spawn(async move {
+                sm.add_error_response_delay().await;
+            });
             ApiError::Unauthorized("No claims in token".to_string()).to_response(is_json)
         })?;
 
         let sub = claims
             .get_claim("sub")
             .ok_or_else(|| {
+                // Add error response timing for missing subject claim
+                let sm = security_manager.clone();
+                tokio::spawn(async move {
+                    sm.add_error_response_delay().await;
+                });
                 ApiError::Unauthorized("No subject claim in token".to_string()).to_response(is_json)
             })?
             .as_str()
             .ok_or_else(|| {
+                // Add error response timing for invalid subject claim format
+                let sm = security_manager.clone();
+                tokio::spawn(async move {
+                    sm.add_error_response_delay().await;
+                });
                 ApiError::Unauthorized("Invalid subject claim format".to_string())
                     .to_response(is_json)
             })?;
@@ -332,9 +360,13 @@ async fn auth_validation(
         if constant_time_eq(&normalized_uuid, &normalized_sub) {
             Ok(())
         } else {
+            // Add error response timing for authentication failure
+            security_manager.add_error_response_delay().await;
             Err(ApiError::Unauthorized("Authentication failed".to_string()).to_response(is_json))
         }
     } else {
+        // Add error response timing for missing token
+        security_manager.add_error_response_delay().await;
         Err(ApiError::Unauthorized("No token".to_string()).to_response(is_json))
     }
 }
@@ -469,7 +501,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let rate_limit_filter = with_rate_limiting(security_manager.clone());
     let login_rate_limit_filter = with_login_rate_limiting(security_manager.clone());
 
-    let _security_filter = warp::any().map(move || Arc::clone(&security_manager));
+    let security_filter = warp::any().map(move || Arc::clone(&security_manager));
     let cookies_filter = warp::filters::cookie::optional("token");
     let header_filter = warp::filters::header::optional("Authorization");
     let create_user_json = warp::post()
@@ -486,20 +518,23 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
             |uui: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, Some(token), false).await
+                    {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &uui, header, false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, header, false).await {
                         return Ok(response);
                     }
                 }
@@ -512,20 +547,22 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
             |uui: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, Some(token), true).await {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &uui, header, true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, header, true).await {
                         return Ok(response);
                     }
                 }
@@ -546,20 +583,22 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
             |uui: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, Some(token), true).await {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &uui, header, true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, header, true).await {
                         return Ok(response);
                     }
                 }
@@ -572,20 +611,23 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
             |uui: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, Some(token), false).await
+                    {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &uui, header, false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, header, false).await {
                         return Ok(response);
                     }
                 }
@@ -599,6 +641,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::body::bytes())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -606,14 +649,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              pass: bytes::Bytes,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, Some(token), false).await
+                    {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &uui, header, false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, header, false).await {
                         return Ok(response);
                     }
                 }
@@ -627,6 +672,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::body::json())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -634,14 +680,15 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              pass: EP,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, Some(token), true).await {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &uui, header, true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, header, true).await {
                         return Ok(response);
                     }
                 }
@@ -704,6 +751,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::body::bytes())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -712,14 +760,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              pass: bytes::Bytes,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, Some(token), false).await
+                    {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &uui, header, false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, header, false).await {
                         return Ok(response);
                     }
                 }
@@ -734,6 +784,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::body::json())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -742,14 +793,15 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              pass: EP,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, Some(token), true).await {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &uui, header, true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, header, true).await {
                         return Ok(response);
                     }
                 }
@@ -763,6 +815,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -770,14 +823,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              uui2: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, Some(token), false).await
+                    {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &uui, header, false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, header, false).await {
                         return Ok(response);
                     }
                 }
@@ -791,6 +846,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -798,14 +854,15 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              uui2: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, Some(token), true).await {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &uui, header, true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, header, true).await {
                         return Ok(response);
                     }
                 }
@@ -819,6 +876,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -826,14 +884,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              uui2: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, Some(token), false).await
+                    {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &uui, header, false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, header, false).await {
                         return Ok(response);
                     }
                 }
@@ -847,6 +907,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -854,14 +915,15 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              uui2: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, Some(token), true).await {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &uui, header, true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &uui, header, true).await {
                         return Ok(response);
                     }
                 }
@@ -877,6 +939,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::body::bytes())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -886,14 +949,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              shared_pass: bytes::Bytes,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &owner, Some(token), false).await {
+                    if let Err(response) =
+                        auth_validation(sk, &sm, &owner, Some(token), false).await
+                    {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &owner, header, false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &owner, header, false).await {
                         return Ok(response);
                     }
                 }
@@ -909,6 +975,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::body::json())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -918,14 +985,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              shared_pass: crate::protocol::SharedPass,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &owner, Some(token), true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &owner, Some(token), true).await
+                    {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &owner, header, true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &owner, header, true).await {
                         return Ok(response);
                     }
                 }
@@ -940,6 +1009,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>()) // recipient id
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -948,14 +1018,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              recipient: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &owner, Some(token), false).await {
+                    if let Err(response) =
+                        auth_validation(sk, &sm, &owner, Some(token), false).await
+                    {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &owner, header, false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &owner, header, false).await {
                         return Ok(response);
                     }
                 }
@@ -970,6 +1043,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>()) // recipient id
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -978,14 +1052,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              recipient: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &owner, Some(token), true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &owner, Some(token), true).await
+                    {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &owner, header, true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &owner, header, true).await {
                         return Ok(response);
                     }
                 }
@@ -1000,6 +1076,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>()) // pass id
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -1008,15 +1085,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              pass_id: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &recipient, Some(token), false).await
+                    if let Err(response) =
+                        auth_validation(sk, &sm, &recipient, Some(token), false).await
                     {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &recipient, header, false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &recipient, header, false).await
+                    {
                         return Ok(response);
                     }
                 }
@@ -1031,6 +1111,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>()) // pass id
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -1039,15 +1120,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              pass_id: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &recipient, Some(token), true).await
+                    if let Err(response) =
+                        auth_validation(sk, &sm, &recipient, Some(token), true).await
                     {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &recipient, header, true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &recipient, header, true).await
+                    {
                         return Ok(response);
                     }
                 }
@@ -1084,20 +1168,24 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
             |owner: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &owner, Some(token), false).await {
+                    if let Err(response) =
+                        auth_validation(sk, &sm, &owner, Some(token), false).await
+                    {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &owner, header, false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &owner, header, false).await {
                         return Ok(response);
                     }
                 }
@@ -1131,6 +1219,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>()) // pass id
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -1139,15 +1228,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              pass_id: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &recipient, Some(token), false).await
+                    if let Err(response) =
+                        auth_validation(sk, &sm, &recipient, Some(token), false).await
                     {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &recipient, header, false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &recipient, header, false).await
+                    {
                         return Ok(response);
                     }
                 }
@@ -1162,6 +1254,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>()) // pass id
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -1170,15 +1263,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              pass_id: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &recipient, Some(token), true).await
+                    if let Err(response) =
+                        auth_validation(sk, &sm, &recipient, Some(token), true).await
                     {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &recipient, header, true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &recipient, header, true).await
+                    {
                         return Ok(response);
                     }
                 }
@@ -1193,6 +1289,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>()) // pass id
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -1201,15 +1298,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              pass_id: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &recipient, Some(token), false).await
+                    if let Err(response) =
+                        auth_validation(sk, &sm, &recipient, Some(token), false).await
                     {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &recipient, header, false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &recipient, header, false).await
+                    {
                         return Ok(response);
                     }
                 }
@@ -1224,6 +1324,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>()) // pass id
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -1232,15 +1333,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              pass_id: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &recipient, Some(token), true).await
+                    if let Err(response) =
+                        auth_validation(sk, &sm, &recipient, Some(token), true).await
                     {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &recipient, header, true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &recipient, header, true).await
+                    {
                         return Ok(response);
                     }
                 }
@@ -1255,6 +1359,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>()) // recipient id
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -1263,14 +1368,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              recipient: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &owner, Some(token), false).await {
+                    if let Err(response) =
+                        auth_validation(sk, &sm, &owner, Some(token), false).await
+                    {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &owner, header, false).await {
+                    if let Err(response) = auth_validation(sk, &sm, &owner, header, false).await {
                         return Ok(response);
                     }
                 }
@@ -1284,6 +1392,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path::param::<String>()) // recipient id
         .and(server_filter.clone())
         .and(mutexsk_filter.clone())
+        .and(security_filter.clone())
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
@@ -1292,14 +1401,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              recipient: String,
              server2: ServerArc,
              sk: Arc<RwLock<SymmetricKey<V4>>>,
+             sm: Arc<SecurityManager>,
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &owner, Some(token), true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &owner, Some(token), true).await
+                    {
                         return Ok(response);
                     }
                 } else {
-                    if let Err(response) = auth_validation(sk, &owner, header, true).await {
+                    if let Err(response) = auth_validation(sk, &sm, &owner, header, true).await {
                         return Ok(response);
                     }
                 }
