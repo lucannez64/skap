@@ -1,11 +1,9 @@
-use std::error::Error;
 use std::{fs::File, str::FromStr};
 
 use crate::protocol::{PassesT, ProtocolError, ResultP, SharedByUser, SharedPassesT, UsersT};
 use deadpool_postgres::{
-    tokio_postgres, GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod,
+    tokio_postgres, Manager, ManagerConfig, Pool, RecyclingMethod,
 };
-use once_cell::sync::Lazy;
 use tokio_postgres_tls::MakeRustlsConnect;
 use uuid::Uuid;
 

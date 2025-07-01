@@ -1,6 +1,5 @@
 use base64::Engine;
 use blake3::hash;
-use chacha20poly1305::consts::P2;
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -30,10 +29,8 @@ use crate::redis::RedisSecrets;
 
 use fips204::ml_dsa_87;
 use fips204::traits::{SerDes, Signer, Verifier};
-use serde::de::{self, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
-use std::fmt;
 use std::io::Write;
 use std::{collections::HashMap, io::Read};
 use uuid::Uuid;
@@ -661,7 +658,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
     pub async fn sync(&mut self, id: Uuid) -> ResultP<[u8; KYBER_CIPHERTEXTBYTES]> {
         let ck = self.get_user(id).await?;
         let option = self.secrets.get_secret(id)?;
-        if let Some((secret, ciphertext)) = option {
+        if let Some((_secret, ciphertext)) = option {
             let ciphertext2: [u8; KYBER_CIPHERTEXTBYTES] = ciphertext
                 .try_into()
                 .map_err(|_| ProtocolError::CryptoError)?;
@@ -677,7 +674,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
     pub async fn send(&self, id: Uuid, pass_id: Uuid) -> ResultP<EP> {
         let _ck = self.get_user(id).await?;
         let option = self.secrets.get_secret(id)?;
-        if let Some((secret, ciphertext)) = option {
+        if let Some((secret, _ciphertext)) = option {
             let hash = hash(&secret);
             let key: &Key = Key::from_slice(hash.as_bytes());
             let cipher = XChaCha20Poly1305::new(key);
@@ -705,7 +702,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         if let None = option {
             return Err(ProtocolError::StorageError);
         }
-        let (secret, ciphertext) = option.ok_or(ProtocolError::StorageError)?;
+        let (secret, _ciphertext) = option.ok_or(ProtocolError::StorageError)?;
         let hash = hash(&secret);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
@@ -745,7 +742,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         if let None = option {
             return Err(ProtocolError::StorageError);
         }
-        let (secret, ciphertext) = option.ok_or(ProtocolError::StorageError)?;
+        let (secret, _ciphertext) = option.ok_or(ProtocolError::StorageError)?;
         let id2 = Uuid::new_v4();
         let hash = hash(&secret);
         let key: &Key = Key::from_slice(hash.as_bytes());
@@ -772,7 +769,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         if let None = option {
             return Err(ProtocolError::StorageError);
         }
-        let (secret, ciphertext) = option.ok_or(ProtocolError::StorageError)?;
+        let (secret, _ciphertext) = option.ok_or(ProtocolError::StorageError)?;
         let hash = hash(&secret);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);

@@ -2,6 +2,7 @@ use crate::protocol::{ChallengesT, ProtocolError, ResultP, SecretsT, KYBER_CIPHE
 use redis::{Client, Commands, RedisError};
 use std::time::Duration;
 use uuid::Uuid;
+use std::env;
 
 // Constantes pour les préfixes de clés
 const SECRET_KEY_PREFIX: &str = "secret:";
@@ -43,7 +44,25 @@ pub struct RedisChallenges {
 
 impl RedisSecrets {
     pub fn new(url: &str) -> Result<Self, RedisError> {
-        let client = Client::open(url)?;
+        // Check if TLS is enabled
+        let use_tls = env::var("REDIS_TLS_ENABLED")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse::<bool>()
+            .unwrap_or(false);
+
+        let client = if use_tls {
+            // For TLS connections, ensure the URL uses rediss://
+            let tls_url = if url.starts_with("redis://") {
+                url.replace("redis://", "rediss://")
+            } else {
+                url.to_string()
+            };
+            
+            Client::open(tls_url.as_str())?
+        } else {
+            Client::open(url)?
+        };
+        
         // Vérifier la connexion au démarrage
         let mut con = client.get_connection()?;
 
@@ -64,6 +83,10 @@ impl RedisSecrets {
 
         let _: String = redis::cmd("AUTH").arg(&redis_password).query(&mut con)?;
         let _: String = redis::cmd("PING").query(&mut con)?;
+
+        if use_tls {
+            println!("Redis TLS connection established successfully");
+        }
 
         Ok(RedisSecrets { client })
     }
@@ -81,7 +104,25 @@ impl RedisSecrets {
 
 impl RedisChallenges {
     pub fn new(url: &str) -> Result<Self, RedisError> {
-        let client = Client::open(url)?;
+        // Check if TLS is enabled
+        let use_tls = env::var("REDIS_TLS_ENABLED")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse::<bool>()
+            .unwrap_or(false);
+
+        let client = if use_tls {
+            // For TLS connections, ensure the URL uses rediss://
+            let tls_url = if url.starts_with("redis://") {
+                url.replace("redis://", "rediss://")
+            } else {
+                url.to_string()
+            };
+            
+            Client::open(tls_url.as_str())?
+        } else {
+            Client::open(url)?
+        };
+        
         // Vérifier la connexion au démarrage
         let mut con = client.get_connection()?;
 
@@ -102,6 +143,10 @@ impl RedisChallenges {
 
         let _: String = redis::cmd("AUTH").arg(&redis_password).query(&mut con)?;
         let _: String = redis::cmd("PING").query(&mut con)?;
+
+        if use_tls {
+            println!("Redis TLS connection established successfully");
+        }
 
         Ok(RedisChallenges { client })
     }

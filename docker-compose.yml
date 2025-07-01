@@ -84,6 +84,7 @@ services:
       - DATABASE_URL=postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-skap}
       - REDIS_URL=redis://redis:6379
       - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD must be set for security}  # SECURITY: Redis authentication mandatory
+      - REDIS_TLS_ENABLED=${REDIS_TLS_ENABLED:-false}  # SECURITY: Enable Redis TLS encryption
       - BASE64_KEY=${BASE64_KEY:?BASE64_KEY must be provided for security}  # SECURITY: Must be provided via environment variable
     volumes:
       - ca-cert:/app/certs:ro

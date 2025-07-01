@@ -3,16 +3,15 @@ use crate::postgres::SharedPassesPostgres;
 use crate::postgres::UsersPostgres;
 use crate::protocol::ProtocolError;
 use crate::protocol::Server as Server2;
-use crate::protocol::SharedByUser;
 use crate::protocol::SharedPass;
 use crate::protocol::CK;
 use crate::protocol::EP;
 use crate::redis::RedisChallenges;
 use crate::redis::RedisSecrets;
+use crate::security::{SecurityManager, with_rate_limiting, with_login_rate_limiting};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use core::convert::TryInto;
 use pasetors::claims::{Claims, ClaimsValidationRules};
-use pasetors::keys::{Generate, SymmetricKey};
+use pasetors::keys::SymmetricKey;
 use pasetors::token::UntrustedToken;
 use pasetors::{local, version4::V4, Local};
 use regex::Regex;
@@ -25,7 +24,7 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use uuid::Uuid;
-use warp::{reject, reply::Response, Filter, Rejection, Reply};
+use warp::{reply::Response, Reply};
 
 // Constant-time string comparison to prevent timing attacks
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -453,13 +452,24 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     log::info!("Successfully loaded and validated symmetric key from BASE64_KEY");
 
+    // Initialize SecurityManager
+    let security_manager = Arc::new(SecurityManager::new());
+    log::info!("SecurityManager initialized with rate limiting and session management");
+
     let mutexsk = Arc::new(RwLock::new(sk));
     let server_filter = warp::any().map(move || Arc::clone(&server2));
     let mutexsk_filter = warp::any().map(move || Arc::clone(&mutexsk));
+    
+    // Create rate limiting filters before moving security_manager
+    let rate_limit_filter = with_rate_limiting(security_manager.clone());
+    let login_rate_limit_filter = with_login_rate_limiting(security_manager.clone());
+    
+    let _security_filter = warp::any().map(move || Arc::clone(&security_manager));
     let cookies_filter = warp::filters::cookie::optional("token");
     let header_filter = warp::filters::header::optional("Authorization");
     let create_user_json = warp::post()
         .and(warp::path("create_user_json"))
+        .and(rate_limit_filter.clone())
         .and(warp::body::json())
         .and(server_filter.clone())
         .and_then(
@@ -652,6 +662,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let verify = warp::post()
         .and(warp::path("verify"))
+        .and(login_rate_limit_filter.clone())
         .and(warp::path::param::<String>())
         .and(warp::body::bytes())
         .and(server_filter.clone())
@@ -667,6 +678,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let verify_json = warp::post()
         .and(warp::path("verify_json"))
+        .and(login_rate_limit_filter.clone())
         .and(warp::path::param::<String>())
         .and(warp::body::json())
         .and(server_filter.clone())
@@ -2128,7 +2140,7 @@ async fn create_user_map(body: bytes::Bytes, server2: &ServerArc) -> Result<Resp
     let mut server = server2.write().await;
     log::info!("Adding new user");
     match server.add_user(&mut ck.clone()).await {
-        Ok(uuid) => {
+        Ok(_uuid) => {
             log::info!("User created successfully");
             match bincode::serde::encode_to_vec(&ck, bincode::config::legacy()) {
                 Ok(serialized) => {

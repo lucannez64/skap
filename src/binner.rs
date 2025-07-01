@@ -2,6 +2,7 @@
 mod postgres;
 mod protocol;
 mod redis;
+mod security;
 mod server;
 
 use dotenvy::dotenv;
