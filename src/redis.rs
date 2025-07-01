@@ -1,7 +1,7 @@
+use crate::protocol::{ChallengesT, ProtocolError, ResultP, SecretsT, KYBER_CIPHERTEXTBYTES};
 use redis::{Client, Commands, RedisError};
-use uuid::Uuid;
-use crate::protocol::{SecretsT, ChallengesT, ProtocolError, ResultP, KYBER_CIPHERTEXTBYTES};
 use std::time::Duration;
+use uuid::Uuid;
 
 // Constantes pour les préfixes de clés
 const SECRET_KEY_PREFIX: &str = "secret:";
@@ -27,7 +27,7 @@ fn vec_to_array(vec: Vec<u8>) -> ResultP<[u8; 32]> {
         eprintln!("Invalid data length: expected 32, got {}", vec.len());
         return Err(ProtocolError::StorageError);
     }
-    
+
     let mut array = [0u8; 32];
     array.copy_from_slice(&vec);
     Ok(array)
@@ -47,15 +47,15 @@ impl RedisSecrets {
         // Vérifier la connexion au démarrage
         let mut con = client.get_connection()?;
         let _: String = redis::cmd("PING").query(&mut con)?;
-        
+
         Ok(RedisSecrets { client })
     }
-    
+
     // Méthode utilitaire pour obtenir une connexion
     fn get_connection(&self) -> ResultP<redis::Connection> {
         handle_redis_error!(self.client.get_connection())
     }
-    
+
     // Méthode utilitaire pour construire la clé
     fn make_key(id: Uuid) -> String {
         format!("{}{}", SECRET_KEY_PREFIX, id)
@@ -68,15 +68,15 @@ impl RedisChallenges {
         // Vérifier la connexion au démarrage
         let mut con = client.get_connection()?;
         let _: String = redis::cmd("PING").query(&mut con)?;
-        
+
         Ok(RedisChallenges { client })
     }
-    
+
     // Méthode utilitaire pour obtenir une connexion
     fn get_connection(&self) -> ResultP<redis::Connection> {
         handle_redis_error!(self.client.get_connection())
     }
-    
+
     // Méthode utilitaire pour construire la clé
     fn make_key(id: Uuid) -> String {
         format!("{}{}", CHALLENGE_KEY_PREFIX, id)
@@ -87,22 +87,22 @@ impl SecretsT for RedisSecrets {
     fn get_secret(&self, id: Uuid) -> ResultP<Option<([u8; 32], [u8; KYBER_CIPHERTEXTBYTES])>> {
         let mut con = self.get_connection()?;
         let key = Self::make_key(id);
-        
+
         match handle_redis_error!(con.get::<_, Vec<u8>>(key)) {
             Ok(bytes) => {
                 if bytes.len() == 32 + KYBER_CIPHERTEXTBYTES {
                     let mut secret = [0u8; 32];
                     let mut ciphertext = [0u8; KYBER_CIPHERTEXTBYTES];
-                    
+
                     secret.copy_from_slice(&bytes[..32]);
                     ciphertext.copy_from_slice(&bytes[32..]);
-                    
+
                     Ok(Some((secret, ciphertext)))
                 } else {
                     Ok(None)
                 }
             }
-            Err(_) => Ok(None)
+            Err(_) => Ok(None),
         }
     }
 
@@ -117,7 +117,7 @@ impl SecretsT for RedisSecrets {
 
         let key = Self::make_key(id);
         let expiry = Duration::from_secs(SECRET_EXPIRATION_SECS);
-        
+
         let mut bytes = Vec::with_capacity(32 + KYBER_CIPHERTEXTBYTES);
         bytes.extend_from_slice(&secret);
         bytes.extend_from_slice(&ciphertext);
@@ -139,7 +139,7 @@ impl ChallengesT for RedisChallenges {
         if let Ok(mut con) = self.get_connection() {
             let key = Self::make_key(id);
             let expiry = Duration::from_secs(CHALLENGE_EXPIRATION_SECS);
-            
+
             if let Err(e) = con.set_ex::<_, _, ()>(key, challenge.to_vec(), expiry.as_secs()) {
                 eprintln!("Error adding challenge: {}", e);
             }
@@ -173,7 +173,7 @@ mod tests {
         let mut secrets = RedisSecrets::new(TEST_REDIS_URL).unwrap();
         let id = Uuid::new_v4();
         let secret = [42u8; 32];
-        
+
         secrets.add_secret(id, secret);
         let retrieved = secrets.get_secret(id);
         assert!(retrieved.is_ok());
@@ -185,13 +185,13 @@ mod tests {
         let mut challenges = RedisChallenges::new(TEST_REDIS_URL).unwrap();
         let id = Uuid::new_v4();
         let challenge = [42u8; 32];
-        
+
         challenges.add_challenge(id, challenge);
         let retrieved = challenges.get_challenge(id);
         assert!(retrieved.is_ok());
         assert_eq!(retrieved.unwrap(), challenge);
     }
-    
+
     #[test]
     fn test_vec_to_array() {
         // Test avec un vecteur de la bonne taille
@@ -199,7 +199,7 @@ mod tests {
         let result = vec_to_array(vec);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), [1u8; 32]);
-        
+
         // Test avec un vecteur trop petit
         let vec = vec![1u8; 16];
         let result = vec_to_array(vec);

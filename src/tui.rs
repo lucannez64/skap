@@ -24,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     io,
     str::FromStr,
-    time::{Duration, SystemTime, UNIX_EPOCH},
     sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -231,13 +231,17 @@ async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
 ) -> io::Result<()> {
-
     let cookie_store = CookieStore::default();
     let jar = Arc::new(CookieStoreRwLock::new(cookie_store));
     let client = reqwest::Client::builder()
         .cookie_provider(Arc::clone(&jar))
         .build()
-        .unwrap();
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to create HTTP client: {}", e),
+            )
+        })?;
 
     loop {
         terminal.draw(|f| ui(f, app))?;
@@ -258,17 +262,33 @@ async fn run_app<B: ratatui::backend::Backend>(
     }
 }
 
-async fn handle_input(key: KeyCode, app: &mut App, client: &reqwest::Client, jar: Arc<CookieStoreRwLock>) {
+async fn handle_input(
+    key: KeyCode,
+    app: &mut App,
+    client: &reqwest::Client,
+    jar: Arc<CookieStoreRwLock>,
+) {
     match app.current_screen {
-        CurrentScreen::Main => handle_main_screen(key, app,client, Arc::clone(&jar)).await,
-        CurrentScreen::AddingPassword => handle_add_screen(key, app, client, Arc::clone(&jar)).await,
-        CurrentScreen::ViewingPasswords => handle_view_screen(key, app, client, Arc::clone(&jar)).await,
-        CurrentScreen::EditingPassword => handle_edit_screen(key, app, client, Arc::clone(&jar)).await,
+        CurrentScreen::Main => handle_main_screen(key, app, client, Arc::clone(&jar)).await,
+        CurrentScreen::AddingPassword => {
+            handle_add_screen(key, app, client, Arc::clone(&jar)).await
+        }
+        CurrentScreen::ViewingPasswords => {
+            handle_view_screen(key, app, client, Arc::clone(&jar)).await
+        }
+        CurrentScreen::EditingPassword => {
+            handle_edit_screen(key, app, client, Arc::clone(&jar)).await
+        }
         CurrentScreen::Exiting => {}
     }
 }
 
-async fn handle_main_screen(key: KeyCode, app: &mut App, client2: &reqwest::Client, jar: Arc<CookieStoreRwLock>) {
+async fn handle_main_screen(
+    key: KeyCode,
+    app: &mut App,
+    client2: &reqwest::Client,
+    jar: Arc<CookieStoreRwLock>,
+) {
     match key {
         KeyCode::Enter => {
             if !app.logged_in {
@@ -279,17 +299,19 @@ async fn handle_main_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
                         app.importing = true;
                         app.importing_total = passwords.len();
                         for password in passwords {
-                            if let Ok(uuid) = client::create_pass(
-                                client2,
-                                client.1.id.unwrap(),
-                                &mut client.0,
-                                password.clone(),
-                                Arc::clone(&jar),
-                            )
-                            .await
-                            {
-                                app.password_list.items.push((password, uuid));
-                                app.importing_state += 1;
+                            if let Some(client_id) = client.1.id {
+                                if let Ok(uuid) = client::create_pass(
+                                    client2,
+                                    client_id,
+                                    &mut client.0,
+                                    password.clone(),
+                                    Arc::clone(&jar),
+                                )
+                                .await
+                                {
+                                    app.password_list.items.push((password, uuid));
+                                    app.importing_state += 1;
+                                }
                             }
                         }
                     }
@@ -347,11 +369,16 @@ async fn handle_main_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
         KeyCode::Char('v') => {
             if app.logged_in {
                 if let Some(client) = &mut app.client {
-                    if let Ok(passwords) =
-                        client::get_all(client2, client.1.id.unwrap(), &mut client.0, Arc::clone(&jar)).await
-                    {
-                        app.password_list.items = passwords.0;
-                        app.current_screen = CurrentScreen::ViewingPasswords;
+                    if let Some(client_id) = client.1.id {
+                        if let Ok(passwords) =
+                            client::get_all(client2, client_id, &mut client.0, Arc::clone(&jar))
+                                .await
+                        {
+                            app.password_list.items = passwords.0;
+                            app.current_screen = CurrentScreen::ViewingPasswords;
+                        }
+                    } else {
+                        app.error_message = Some("Missing client ID".to_string());
                     }
                 }
             } else {
@@ -375,8 +402,8 @@ async fn try_create(
     let (mut client, ck) = client::new(client2, email)
         .await
         .map_err(|_| protocol::ProtocolError::AuthError)?;
-    let uuid = ck.id.unwrap();
-    client::auth(client2,  Arc::clone(&jar), uuid, &mut client)
+    let uuid = ck.id.ok_or(protocol::ProtocolError::AuthError)?;
+    client::auth(client2, Arc::clone(&jar), uuid, &mut client)
         .await
         .map_err(|_| protocol::ProtocolError::AuthError)?;
     Ok((client, ck))
@@ -389,8 +416,8 @@ async fn try_login(
 ) -> Result<(crate::protocol::Client, protocol::CK), protocol::ProtocolError> {
     if let Ok(c) = ClientEx::from_file(email.to_string()) {
         let (mut client, ck) = (c.c, c.id);
-        let uuid = ck.id.unwrap();
-        client::auth(client2,  Arc::clone(&jar),uuid, &mut client)
+        let uuid = ck.id.ok_or(protocol::ProtocolError::AuthError)?;
+        client::auth(client2, Arc::clone(&jar), uuid, &mut client)
             .await
             .map_err(|_| protocol::ProtocolError::AuthError)?;
         Ok((client, ck))
@@ -399,21 +426,46 @@ async fn try_login(
     }
 }
 
-async fn handle_add_screen(key: KeyCode, app: &mut App, client2: &reqwest::Client, jar: Arc<CookieStoreRwLock>) {
+async fn handle_add_screen(
+    key: KeyCode,
+    app: &mut App,
+    client2: &reqwest::Client,
+    jar: Arc<CookieStoreRwLock>,
+) {
     match key {
         KeyCode::Char(c) => match app.current_field {
             0 => app.new_password.username.push(c),
             1 => app.new_password.password.push(c),
-            2 => app.new_password.url.as_mut().unwrap().push(c),
-            3 => app.new_password.otp.as_mut().unwrap().push(c),
+            2 => {
+                if let Some(url) = app.new_password.url.as_mut() {
+                    url.push(c);
+                }
+            }
+            3 => {
+                if let Some(otp) = app.new_password.otp.as_mut() {
+                    otp.push(c);
+                }
+            }
             _ => {}
         },
         KeyCode::Backspace => {
             match app.current_field {
                 0 => app.new_password.username.pop(),
                 1 => app.new_password.password.pop(),
-                2 => app.new_password.url.as_mut().unwrap().pop(),
-                3 => app.new_password.otp.as_mut().unwrap().pop(),
+                2 => {
+                    if let Some(url) = app.new_password.url.as_mut() {
+                        url.pop()
+                    } else {
+                        None
+                    }
+                }
+                3 => {
+                    if let Some(otp) = app.new_password.otp.as_mut() {
+                        otp.pop()
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             };
         }
@@ -425,25 +477,33 @@ async fn handle_add_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clien
         }
         KeyCode::Enter => {
             if let Some(client) = &mut app.client {
-                if let Ok(uuid) = client::create_pass(
-                    client2,
-                    client.1.id.unwrap(),
-                    &mut client.0,
-                    app.new_password.clone(),
-                    Arc::clone(&jar),
-                )
-                .await
-                {
-                    app.password_list
-                        .items
-                        .push((app.new_password.clone(), uuid));
-                    app.new_password.username.clear();
-                    app.new_password.password.clear();
-                    app.new_password.url.as_mut().unwrap().clear();
-                    app.new_password.otp.as_mut().unwrap().clear();
-                    app.current_screen = CurrentScreen::Main;
+                if let Some(client_id) = client.1.id {
+                    if let Ok(uuid) = client::create_pass(
+                        client2,
+                        client_id,
+                        &mut client.0,
+                        app.new_password.clone(),
+                        Arc::clone(&jar),
+                    )
+                    .await
+                    {
+                        app.password_list
+                            .items
+                            .push((app.new_password.clone(), uuid));
+                        app.new_password.username.clear();
+                        app.new_password.password.clear();
+                        if let Some(url) = app.new_password.url.as_mut() {
+                            url.clear();
+                        }
+                        if let Some(otp) = app.new_password.otp.as_mut() {
+                            otp.clear();
+                        }
+                        app.current_screen = CurrentScreen::Main;
+                    } else {
+                        app.error_message = Some("Failed to create password".to_string());
+                    }
                 } else {
-                    app.error_message = Some("Failed to create password".to_string());
+                    app.error_message = Some("Missing client ID".to_string());
                 }
             }
         }
@@ -454,7 +514,12 @@ async fn handle_add_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clien
     }
 }
 
-async fn handle_view_screen(key: KeyCode, app: &mut App, client2: &reqwest::Client, jar: Arc<CookieStoreRwLock>) {
+async fn handle_view_screen(
+    key: KeyCode,
+    app: &mut App,
+    client2: &reqwest::Client,
+    jar: Arc<CookieStoreRwLock>,
+) {
     match key {
         KeyCode::Char('q') => {
             if app.searching {
@@ -487,13 +552,17 @@ async fn handle_view_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
             } else if let Some(selected) = app.password_list.state.selected() {
                 let (_, uuid) = &app.password_list.items[selected];
                 if let Some(client) = &mut app.client {
-                    if client::delete_pass(client2, client.1.id.unwrap(), *uuid, Arc::clone(&jar))
-                        .await
-                        .is_ok()
-                    {
-                        app.password_list.items.remove(selected);
+                    if let Some(client_id) = client.1.id {
+                        if client::delete_pass(client2, client_id, *uuid, Arc::clone(&jar))
+                            .await
+                            .is_ok()
+                        {
+                            app.password_list.items.remove(selected);
+                        } else {
+                            app.error_message = Some("Failed to delete password".to_string());
+                        }
                     } else {
-                        app.error_message = Some("Failed to delete password".to_string());
+                        app.error_message = Some("Missing client ID".to_string());
                     }
                 }
             }
@@ -523,9 +592,23 @@ async fn handle_view_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
             if app.searching {
                 app.search.push('o');
             } else if let Some(selected) = app.password_list.state.selected() {
-                if app.password_list.items[selected].0.otp.is_some() {
-                    let totp = otp(app.password_list.items[selected].0.otp.as_ref().unwrap());
-                    app.ctx.set_contents(totp.generate().to_string()).unwrap();
+                if let Some(otp_uri) = &app.password_list.items[selected].0.otp {
+                    match otp(otp_uri) {
+                        Ok(totp) => match totp.generate() {
+                            Ok(code) => {
+                                if let Err(_) = app.ctx.set_contents(code) {
+                                    app.error_message =
+                                        Some("Failed to copy OTP to clipboard".to_string());
+                                }
+                            }
+                            Err(e) => {
+                                app.error_message = Some(format!("Failed to generate OTP: {}", e));
+                            }
+                        },
+                        Err(e) => {
+                            app.error_message = Some(format!("Invalid OTP URI: {}", e));
+                        }
+                    }
                 }
             }
         }
@@ -566,7 +649,12 @@ async fn handle_view_screen(key: KeyCode, app: &mut App, client2: &reqwest::Clie
     }
 }
 
-async fn handle_edit_screen(key: KeyCode, app: &mut App, client2: &reqwest::Client, jar: Arc<CookieStoreRwLock>) {
+async fn handle_edit_screen(
+    key: KeyCode,
+    app: &mut App,
+    client2: &reqwest::Client,
+    jar: Arc<CookieStoreRwLock>,
+) {
     match key {
         KeyCode::Char(c) => match app.current_field {
             0 => app.edit_password.username.push(c),
@@ -859,9 +947,8 @@ fn render_edit_screen(f: &mut Frame, app: &mut App, chunks: Vec<ratatui::layout:
     f.render_widget(help_text, chunks[1]);
 }
 
-pub fn otp(uri: &str) -> TOTP {
-    let totp = TOTP::from_uri(uri);
-    totp
+pub fn otp(uri: &str) -> Result<TOTP, String> {
+    TOTP::from_uri(uri)
 }
 
 pub fn jsonfile_to_vec(filename: String) -> Result<Vec<Password>, io::Error> {
@@ -918,13 +1005,13 @@ pub struct TOTP {
 }
 
 impl TOTP {
-    fn from_uri(uri: &str) -> TOTP {
-        let parsed_uri = url::Url::parse(uri).unwrap();
+    fn from_uri(uri: &str) -> Result<TOTP, String> {
+        let parsed_uri = url::Url::parse(uri).map_err(|e| format!("Invalid URI: {}", e))?;
         let secret = parsed_uri
             .query_pairs()
             .find(|(k, _v)| k == "secret")
             .map(|(_k, v)| v.to_uppercase())
-            .unwrap();
+            .ok_or("Missing secret parameter")?;
 
         let algorithm = parsed_uri
             .query_pairs()
@@ -944,18 +1031,18 @@ impl TOTP {
             period,
             algorithm,
         };
-        totp
+        Ok(totp)
     }
 
-    fn generate(&self) -> String {
+    fn generate(&self) -> Result<String, String> {
         // Step 1: Get the current timestamp in seconds since the Unix epoch
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| format!("Time error: {}", e))?
             .as_secs();
         let decoded_secret = BASE32_NOPAD
             .decode(self.secret.to_uppercase().as_bytes())
-            .unwrap();
+            .map_err(|e| format!("Base32 decode error: {}", e))?;
         // Step 2: Calculate the counter value
         let counter = current_time / self.period;
 
@@ -997,7 +1084,7 @@ impl TOTP {
             code_bytes[2],
             code_bytes[3],
         ]) % 10u32.pow(self.digits.into());
-        format!("{:0digits$}", code, digits = self.digits as usize)
+        Ok(format!("{:0digits$}", code, digits = self.digits as usize))
     }
 }
 
@@ -1008,8 +1095,8 @@ mod tests {
     #[test]
     fn test_totp_from_uri() {
         let uri = "otpauth://totp/Test:test@test.com?secret=JBSWY3DPEHPK3PXP&issuer=Test&algorithm=SHA1&digits=6&period=30";
-        let totp = TOTP::from_uri(uri);
-        
+        let totp = TOTP::from_uri(uri).unwrap();
+
         assert_eq!(totp.secret, "JBSWY3DPEHPK3PXP");
         assert_eq!(totp.digits, 6);
         assert_eq!(totp.period, 30);
@@ -1019,9 +1106,9 @@ mod tests {
     #[test]
     fn test_totp_generation() {
         let uri = "otpauth://totp/Test:test@test.com?secret=JBSWY3DPEHPK3PXP&issuer=Test&algorithm=SHA1&digits=6&period=30";
-        let totp = TOTP::from_uri(uri);
-        
-        let code = totp.generate();
+        let totp = TOTP::from_uri(uri).unwrap();
+
+        let code = totp.generate().unwrap();
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|c| c.is_digit(10)));
     }

@@ -1,8 +1,8 @@
 #![recursion_limit = "256"]
 mod postgres;
 mod protocol;
-mod server;
 mod redis;
+mod server;
 
 use dotenvy::dotenv;
 

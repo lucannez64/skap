@@ -1,21 +1,21 @@
 use base64::Engine;
 use blake3::hash;
 use chacha20poly1305::consts::P2;
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use thiserror::Error;
-use serde_repr::{Serialize_repr, Deserialize_repr};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[cfg(feature = "server")]
 use crate::postgres::PassesPostgres;
 #[cfg(feature = "server")]
-use crate::postgres::UsersPostgres;
-#[cfg(feature = "server")]
 use crate::postgres::SharedPassesPostgres;
+#[cfg(feature = "server")]
+use crate::postgres::UsersPostgres;
 
 use bytes::BytesMut;
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng, rand_core::RngCore},
-    Key, XChaCha20Poly1305, XNonce, 
+    aead::{rand_core::RngCore, Aead, AeadCore, KeyInit, OsRng},
+    Key, XChaCha20Poly1305, XNonce,
 };
 use libcrux_ml_kem::mlkem1024::{
     self, MlKem1024Ciphertext, MlKem1024PrivateKey, MlKem1024PublicKey,
@@ -28,6 +28,8 @@ use crate::redis::RedisChallenges;
 #[cfg(feature = "server")]
 use crate::redis::RedisSecrets;
 
+use fips204::ml_dsa_87;
+use fips204::traits::{SerDes, Signer, Verifier};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::{serde_as, Bytes};
@@ -35,8 +37,6 @@ use std::fmt;
 use std::io::Write;
 use std::{collections::HashMap, io::Read};
 use uuid::Uuid;
-use fips204::ml_dsa_87;
-use fips204::traits::{SerDes, Signer, Verifier};
 
 pub const KYBER_PUBLICKEYBYTES: usize = 1568;
 pub const KYBER_CIPHERTEXTBYTES: usize = 1568;
@@ -61,7 +61,6 @@ pub enum ProtocolError {
 
 pub type ResultP<T> = std::result::Result<T, ProtocolError>;
 
-
 #[serde_as]
 #[derive(Clone, Serialize, Deserialize, Debug, Copy)]
 pub struct KyPublicKey {
@@ -76,8 +75,6 @@ pub struct SharedByUser {
     pub pass_id: Uuid,
     pub recipient_ids: Vec<Uuid>,
 }
-
-
 
 #[cfg(feature = "server")]
 impl<'a> FromSql<'a> for KyPublicKey {
@@ -153,8 +150,10 @@ impl<'a> FromSql<'a> for DiPublicKey {
         raw: &[u8],
     ) -> Result<DiPublicKey, Box<dyn std::error::Error + Sync + Send>> {
         let bt = postgres_protocol::types::bytea_from_sql(&raw);
-        let tt: [u8; ml_dsa_87::PK_LEN] = bt.try_into().unwrap();
-        let t = DiPublicKey::from_di(ml_dsa_87::PublicKey::try_from_bytes(tt).unwrap());
+        let tt: [u8; ml_dsa_87::PK_LEN] = bt.try_into().map_err(|_| "Invalid public key length")?;
+        let pk =
+            ml_dsa_87::PublicKey::try_from_bytes(tt).map_err(|_| "Invalid public key format")?;
+        let t = DiPublicKey::from_di(pk);
         Ok(t)
     }
 
@@ -179,21 +178,25 @@ impl ToSql for DiPublicKey {
 
 impl DiPublicKey {
     fn from_di(pb: ml_dsa_87::PublicKey) -> Self {
-        DiPublicKey { bytes: pb.into_bytes() }
+        DiPublicKey {
+            bytes: pb.into_bytes(),
+        }
     }
 
-    fn to_di(self) -> ml_dsa_87::PublicKey {
-        ml_dsa_87::PublicKey::try_from_bytes(self.bytes).unwrap()
+    fn to_di(self) -> Result<ml_dsa_87::PublicKey, ProtocolError> {
+        ml_dsa_87::PublicKey::try_from_bytes(self.bytes).map_err(|_| ProtocolError::CryptoError)
     }
 }
 
 impl DiSecretKey {
     fn from_di(pb: ml_dsa_87::PrivateKey) -> Self {
-        DiSecretKey { bytes: pb.into_bytes() }
+        DiSecretKey {
+            bytes: pb.into_bytes(),
+        }
     }
 
-    pub fn to_di(self) -> ml_dsa_87::PrivateKey {
-        ml_dsa_87::PrivateKey::try_from_bytes(self.bytes).unwrap()
+    pub fn to_di(self) -> Result<ml_dsa_87::PrivateKey, ProtocolError> {
+        ml_dsa_87::PrivateKey::try_from_bytes(self.bytes).map_err(|_| ProtocolError::CryptoError)
     }
 }
 
@@ -302,7 +305,11 @@ impl UsersT for Users {
     }
 
     async fn get_user_from_email(&self, email: String) -> ResultP<CK> {
-        self.0.values().find(|user| user.email == email).cloned().ok_or(ProtocolError::StorageError)
+        self.0
+            .values()
+            .find(|user| user.email == email)
+            .cloned()
+            .ok_or(ProtocolError::StorageError)
     }
 
     async fn get_public_key(&self, id: Uuid) -> ResultP<[u8; KYBER_PUBLICKEYBYTES]> {
@@ -311,7 +318,8 @@ impl UsersT for Users {
     }
 
     async fn get_uuids_from_emails(&self, emails: Vec<String>) -> ResultP<Vec<Uuid>> {
-        let uuids = self.0
+        let uuids = self
+            .0
             .values()
             .filter_map(|user| {
                 if emails.contains(&user.email) {
@@ -325,7 +333,8 @@ impl UsersT for Users {
     }
 
     async fn get_emails_from_uuids(&self, uuids: Vec<Uuid>) -> ResultP<Vec<String>> {
-        let emails = self.0
+        let emails = self
+            .0
             .values()
             .filter_map(|user| {
                 if let Some(id) = user.id {
@@ -345,7 +354,12 @@ impl UsersT for Users {
 
 pub trait SecretsT {
     fn get_secret(&self, id: Uuid) -> ResultP<Option<([u8; 32], [u8; KYBER_CIPHERTEXTBYTES])>>;
-    fn add_secret(&mut self, id: Uuid, secret: [u8; KYBER_SSBYTES], ciphertext: [u8; KYBER_CIPHERTEXTBYTES]);
+    fn add_secret(
+        &mut self,
+        id: Uuid,
+        secret: [u8; KYBER_SSBYTES],
+        ciphertext: [u8; KYBER_CIPHERTEXTBYTES],
+    );
 }
 
 pub trait ChallengesT {
@@ -371,7 +385,6 @@ pub trait PassesT {
     async fn update_pass(&mut self, id: Uuid, pass_id: Uuid, pass: Vec<u8>) -> ResultP<()>;
 }
 
-
 pub trait SharedPassesT {
     async fn store_shared_pass(
         &mut self,
@@ -395,24 +408,12 @@ pub trait SharedPassesT {
         recipient: Uuid,
     ) -> ResultP<()>;
 
-    async fn get_all_shared_passes(
-        &self,
-        recipient: Uuid,
-    ) -> ResultP<Vec<(Vec<u8>, Uuid, Uuid)>>;
+    async fn get_all_shared_passes(&self, recipient: Uuid) -> ResultP<Vec<(Vec<u8>, Uuid, Uuid)>>;
 
-    async fn get_shared_by_user(
-        &self,
-        owner: Uuid
-    ) -> ResultP<Vec<SharedByUser>>;
+    async fn get_shared_by_user(&self, owner: Uuid) -> ResultP<Vec<SharedByUser>>;
 
-    async fn get_shared_by_user_and_pass(
-        &self,
-        owner: Uuid,
-        pass_id: Uuid
-    ) -> ResultP<Vec<Uuid>>;
-    
+    async fn get_shared_by_user_and_pass(&self, owner: Uuid, pass_id: Uuid) -> ResultP<Vec<Uuid>>;
 }
-
 
 impl SharedPassesT for SharedPasses {
     async fn store_shared_pass(
@@ -432,7 +433,10 @@ impl SharedPassesT for SharedPasses {
         owner: Uuid,
         pass_id: Uuid,
     ) -> ResultP<Vec<u8>> {
-        self.0.get(&(owner, pass_id, recipient)).cloned().ok_or(ProtocolError::StorageError)
+        self.0
+            .get(&(owner, pass_id, recipient))
+            .cloned()
+            .ok_or(ProtocolError::StorageError)
     }
 
     async fn remove_shared_pass(
@@ -445,10 +449,7 @@ impl SharedPassesT for SharedPasses {
         Ok(())
     }
 
-    async fn get_all_shared_passes(
-        &self,
-        recipient: Uuid,
-    ) -> ResultP<Vec<(Vec<u8>, Uuid, Uuid)>> {
+    async fn get_all_shared_passes(&self, recipient: Uuid) -> ResultP<Vec<(Vec<u8>, Uuid, Uuid)>> {
         let mut shared_passes = Vec::new();
         for ((owner, pass_id, rec), shared_pass) in &self.0 {
             if *rec == recipient {
@@ -458,13 +459,10 @@ impl SharedPassesT for SharedPasses {
         Ok(shared_passes)
     }
 
-    async fn get_shared_by_user(
-        &self,
-        ownerr: Uuid
-    ) -> ResultP<Vec<SharedByUser>> {
+    async fn get_shared_by_user(&self, ownerr: Uuid) -> ResultP<Vec<SharedByUser>> {
         // Utiliser une HashMap pour regrouper les destinataires par ID de mot de passe
         let mut shared_by_pass_id: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
-        
+
         // Collecter tous les destinataires pour chaque mot de passe
         for ((owner, pass_id, rec), _) in &self.0 {
             if *owner == ownerr {
@@ -474,23 +472,20 @@ impl SharedPassesT for SharedPasses {
                     .push(*rec);
             }
         }
-        
+
         // Convertir la HashMap en Vec<SharedByUser>
         let shared_passes = shared_by_pass_id
             .into_iter()
-            .map(|(pass_id, recipient_ids)| {
-                SharedByUser { pass_id, recipient_ids }
+            .map(|(pass_id, recipient_ids)| SharedByUser {
+                pass_id,
+                recipient_ids,
             })
             .collect();
-            
+
         Ok(shared_passes)
     }
 
-    async fn get_shared_by_user_and_pass(
-        &self,
-        owner: Uuid,
-        pass_id: Uuid
-    ) -> ResultP<Vec<Uuid>> {
+    async fn get_shared_by_user_and_pass(&self, owner: Uuid, pass_id: Uuid) -> ResultP<Vec<Uuid>> {
         let shared_passes = self.get_shared_by_user(owner).await?;
         let shared_pass = shared_passes.iter().find(|pass| pass.pass_id == pass_id);
         if let Some(shared_pass) = shared_pass {
@@ -499,7 +494,6 @@ impl SharedPassesT for SharedPasses {
             Err(ProtocolError::StorageError)
         }
     }
-
 }
 
 impl PassesT for Passes {
@@ -616,16 +610,20 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         self.users.get_public_key(id).await
     }
 
-    pub async fn get_all_shared_passes(&self, recipient: Uuid) -> ResultP<Vec<(SharedPass, Uuid, Uuid)>> {
+    pub async fn get_all_shared_passes(
+        &self,
+        recipient: Uuid,
+    ) -> ResultP<Vec<(SharedPass, Uuid, Uuid)>> {
         let mut shared_passes = Vec::new();
         let shared_data = self.shared_passes.get_all_shared_passes(recipient).await?;
-        
+
         for (data, owner_id, pass_id) in shared_data {
             let shared_pass = bincode::serde::decode_from_slice(&data, bincode::config::legacy())
-                .map_err(|_| ProtocolError::DataError)?.0;
+                .map_err(|_| ProtocolError::DataError)?
+                .0;
             shared_passes.push((shared_pass, owner_id, pass_id));
         }
-        
+
         Ok(shared_passes)
     }
 
@@ -635,7 +633,8 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
 
     pub async fn challenge(&mut self, id: Uuid) -> ResultP<[u8; 32]> {
         let mut challenge = [0u8; 32];
-        self.rng.try_fill_bytes(&mut challenge)
+        self.rng
+            .try_fill_bytes(&mut challenge)
             .map_err(|_| ProtocolError::CryptoError)?;
         let _ = self.get_user(id).await?;
         self.challenges.add_challenge(id, challenge);
@@ -643,14 +642,15 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
     }
 
     pub async fn verify(&self, id: Uuid, signature: &[u8]) -> ResultP<()> {
-        if signature.len() !=  ml_dsa_87::SIG_LEN {
+        if signature.len() != ml_dsa_87::SIG_LEN {
             return Err(ProtocolError::AuthError);
         }
         let ck = self.get_user(id).await?;
         let challenge = self.challenges.get_challenge(id)?;
-        let signature2 : [u8; ml_dsa_87::SIG_LEN] = signature.try_into()
-            .map_err(|_| ProtocolError::AuthError)?;
-        let verify = ck.di_p.to_di().verify(&challenge, &signature2, &[]);
+        let signature2: [u8; ml_dsa_87::SIG_LEN] =
+            signature.try_into().map_err(|_| ProtocolError::AuthError)?;
+        let di_key = ck.di_p.to_di().map_err(|_| ProtocolError::CryptoError)?;
+        let verify = di_key.verify(&challenge, &signature2, &[]);
         if verify {
             Ok(())
         } else {
@@ -662,7 +662,8 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         let ck = self.get_user(id).await?;
         let option = self.secrets.get_secret(id)?;
         if let Some((secret, ciphertext)) = option {
-            let ciphertext2: [u8; KYBER_CIPHERTEXTBYTES] = ciphertext.try_into()
+            let ciphertext2: [u8; KYBER_CIPHERTEXTBYTES] = ciphertext
+                .try_into()
                 .map_err(|_| ProtocolError::CryptoError)?;
             return Ok(ciphertext2);
         }
@@ -682,7 +683,9 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
             let cipher = XChaCha20Poly1305::new(key);
             let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
             let pass = self.passes.get_pass(id, pass_id).await?;
-            let passs: EP = bincode::serde::decode_from_slice(&pass, bincode::config::legacy()).unwrap().0;
+            let passs: EP = bincode::serde::decode_from_slice(&pass, bincode::config::legacy())
+                .map_err(|_| ProtocolError::DataError)?
+                .0;
             let ciphertext = cipher
                 .encrypt(&nonce, passs.ciphertext.as_slice())
                 .map_err(|_| ProtocolError::CryptoError)?;
@@ -702,21 +705,24 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         if let None = option {
             return Err(ProtocolError::StorageError);
         }
-        let (secret, ciphertext) = option.unwrap();
+        let (secret, ciphertext) = option.ok_or(ProtocolError::StorageError)?;
         let hash = hash(&secret);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let passes = self.passes.get_all_pass(id).await?;
-        
+
         let results = passes
             .into_iter()
             .map(|(pass_data, pass_id)| {
-                let pass: EP = bincode::serde::decode_from_slice(&pass_data, bincode::config::legacy()).unwrap().0;
+                let pass: EP =
+                    bincode::serde::decode_from_slice(&pass_data, bincode::config::legacy())
+                        .map_err(|_| ProtocolError::DataError)?
+                        .0;
                 let ciphertext = cipher
                     .encrypt(&nonce, pass.ciphertext.as_slice())
                     .map_err(|_| ProtocolError::CryptoError);
-                
+
                 ciphertext.map(|ct| {
                     (
                         EP {
@@ -729,7 +735,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-            
+
         Ok(results)
     }
 
@@ -739,26 +745,23 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         if let None = option {
             return Err(ProtocolError::StorageError);
         }
-        let (secret, ciphertext) = option.unwrap();
+        let (secret, ciphertext) = option.ok_or(ProtocolError::StorageError)?;
         let id2 = Uuid::new_v4();
         let hash = hash(&secret);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
         let nonce2 = pass.nonce2.clone().ok_or(ProtocolError::DataError)?;
 
-
         let pass2 = cipher
             .decrypt(XNonce::from_slice(&nonce2), pass.ciphertext.as_slice())
-            .map_err(|e| {
-                println!("Error decrypting pass: {}", e.to_string());
-                ProtocolError::CryptoError
-            })?;
+            .map_err(|_| ProtocolError::CryptoError)?;
         let ep = EP {
             ciphertext: pass2,
             nonce: pass.nonce,
             nonce2: None,
         };
-        let bi = bincode::serde::encode_to_vec(&ep, bincode::config::legacy()).map_err(|_| ProtocolError::DataError)?;
+        let bi = bincode::serde::encode_to_vec(&ep, bincode::config::legacy())
+            .map_err(|_| ProtocolError::DataError)?;
         self.passes.add_pass(id, id2, bi).await?;
         Ok(id2)
     }
@@ -769,7 +772,7 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         if let None = option {
             return Err(ProtocolError::StorageError);
         }
-        let (secret, ciphertext) = option.unwrap();
+        let (secret, ciphertext) = option.ok_or(ProtocolError::StorageError)?;
         let hash = hash(&secret);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
@@ -782,16 +785,23 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
             nonce: pass.nonce,
             nonce2: None,
         };
-        let bi = bincode::serde::encode_to_vec(&ep, bincode::config::legacy()).map_err(|_| ProtocolError::DataError)?;
+        let bi = bincode::serde::encode_to_vec(&ep, bincode::config::legacy())
+            .map_err(|_| ProtocolError::DataError)?;
         self.passes.update_pass(id, passid, bi).await?;
         Ok(())
     }
 
     pub async fn delete_pass(&mut self, id: Uuid, passid: Uuid) -> ResultP<()> {
         let _ck = self.get_user(id).await?;
-        if let Ok(recipients) = self.shared_passes.get_shared_by_user_and_pass(id, passid).await {
+        if let Ok(recipients) = self
+            .shared_passes
+            .get_shared_by_user_and_pass(id, passid)
+            .await
+        {
             for recipient in recipients {
-                self.shared_passes.remove_shared_pass(id, passid, recipient).await?;
+                self.shared_passes
+                    .remove_shared_pass(id, passid, recipient)
+                    .await?;
             }
         }
         self.passes.remove_pass(id, passid).await?;
@@ -808,15 +818,23 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
     ) -> ResultP<()> {
         // Sérialiser le mot de passe partagé
         let mut shared_pass2 = shared_pass.clone();
-        if let Ok(a) = self.shared_passes.get_shared_pass(recipient, owner, pass_id).await {
-            let shared_pass3: SharedPass = bincode::serde::decode_from_slice(&a, bincode::config::legacy()).unwrap().0;
+        if let Ok(a) = self
+            .shared_passes
+            .get_shared_pass(recipient, owner, pass_id)
+            .await
+        {
+            let shared_pass3: SharedPass =
+                bincode::serde::decode_from_slice(&a, bincode::config::legacy())
+                    .map_err(|_| ProtocolError::DataError)?
+                    .0;
             shared_pass2.status = shared_pass3.status;
         } else {
             shared_pass2.status = ShareStatus::Pending;
         }
-        let shared_serialized = bincode::serde::encode_to_vec(&shared_pass2, bincode::config::legacy())
-            .map_err(|_| ProtocolError::DataError)?;
-            
+        let shared_serialized =
+            bincode::serde::encode_to_vec(&shared_pass2, bincode::config::legacy())
+                .map_err(|_| ProtocolError::DataError)?;
+
         // Stocker dans la base de données
         self.shared_passes
             .store_shared_pass(owner, pass_id, recipient, shared_serialized)
@@ -842,18 +860,18 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         owner: Uuid,
         pass_id: Uuid,
     ) -> ResultP<SharedPass> {
-        let shared_data = self.shared_passes
+        let shared_data = self
+            .shared_passes
             .get_shared_pass(recipient, owner, pass_id)
             .await?;
-        bincode::serde::decode_from_slice(&shared_data, bincode::config::legacy()).map(|(result, _)| result)
+        bincode::serde::decode_from_slice(&shared_data, bincode::config::legacy())
+            .map(|(result, _)| result)
             .map_err(|_| ProtocolError::DataError)
     }
 
-    pub async fn get_shared_by_user(
-        &self,
-        owner: Uuid
-    ) -> ResultP<Vec<SharedByUser>> {
-        let shared_by_user: Vec<SharedByUser> = self.shared_passes.get_shared_by_user(owner).await?;
+    pub async fn get_shared_by_user(&self, owner: Uuid) -> ResultP<Vec<SharedByUser>> {
+        let shared_by_user: Vec<SharedByUser> =
+            self.shared_passes.get_shared_by_user(owner).await?;
         Ok(shared_by_user)
     }
 
@@ -861,13 +879,16 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         &mut self,
         owner: Uuid,
         pass_id: Uuid,
-        recipient: Uuid
+        recipient: Uuid,
     ) -> ResultP<()> {
         let mut shared_pass = self.get_shared_pass(recipient, owner, pass_id).await?;
         shared_pass.status = ShareStatus::Accepted;
-        let shared_serialized = bincode::serde::encode_to_vec(&shared_pass, bincode::config::legacy())
-            .map_err(|_| ProtocolError::DataError)?;
-        self.shared_passes.store_shared_pass(owner, pass_id, recipient, shared_serialized).await?;
+        let shared_serialized =
+            bincode::serde::encode_to_vec(&shared_pass, bincode::config::legacy())
+                .map_err(|_| ProtocolError::DataError)?;
+        self.shared_passes
+            .store_shared_pass(owner, pass_id, recipient, shared_serialized)
+            .await?;
         Ok(())
     }
 
@@ -875,31 +896,35 @@ impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Serve
         &self,
         owner: Uuid,
         pass_id: Uuid,
-        recipient: Uuid
+        recipient: Uuid,
     ) -> ResultP<ShareStatus> {
-        let shared_data = self.shared_passes
+        let shared_data = self
+            .shared_passes
             .get_shared_pass(recipient, owner, pass_id)
             .await?;
-        let shared_pass: SharedPass = bincode::serde::decode_from_slice(&shared_data, bincode::config::legacy())
-            .map_err(|_| ProtocolError::DataError)?.0;
+        let shared_pass: SharedPass =
+            bincode::serde::decode_from_slice(&shared_data, bincode::config::legacy())
+                .map_err(|_| ProtocolError::DataError)?
+                .0;
         Ok(shared_pass.status)
     }
-    
 
     pub async fn reject_shared_pass(
         &mut self,
         owner: Uuid,
         pass_id: Uuid,
-        recipient: Uuid
+        recipient: Uuid,
     ) -> ResultP<()> {
         let mut shared_pass = self.get_shared_pass(recipient, owner, pass_id).await?;
         shared_pass.status = ShareStatus::Rejected;
-        let shared_serialized = bincode::serde::encode_to_vec(&shared_pass, bincode::config::legacy())
-            .map_err(|_| ProtocolError::DataError)?;
-        self.shared_passes.store_shared_pass(owner, pass_id, recipient, shared_serialized).await?;
+        let shared_serialized =
+            bincode::serde::encode_to_vec(&shared_pass, bincode::config::legacy())
+                .map_err(|_| ProtocolError::DataError)?;
+        self.shared_passes
+            .store_shared_pass(owner, pass_id, recipient, shared_serialized)
+            .await?;
         Ok(())
     }
-    
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1006,7 +1031,8 @@ impl ClientEx {
             .map_err(|_| ProtocolError::DataError)
             .unwrap();
         let c = bincode::serde::decode_from_slice(&a, bincode::config::legacy())
-            .map_err(|_| ProtocolError::DataError)?.0;
+            .map_err(|_| ProtocolError::DataError)?
+            .0;
         Ok(c)
     }
 }
@@ -1030,7 +1056,8 @@ impl Client {
     }
 
     pub fn encrypt(&self, pass: Password) -> ResultP<EP> {
-        let passb = bincode::serde::encode_to_vec(&pass, bincode::config::legacy()).map_err(|_| ProtocolError::DataError)?;
+        let passb = bincode::serde::encode_to_vec(&pass, bincode::config::legacy())
+            .map_err(|_| ProtocolError::DataError)?;
         let hash = hash(&self.ky_q);
         let key: &Key = Key::from_slice(hash.as_bytes());
         let cipher = XChaCha20Poly1305::new(key);
@@ -1087,12 +1114,16 @@ impl Client {
         let pass = cipher
             .decrypt(XNonce::from_slice(&ep.nonce), ep.ciphertext.as_slice())
             .map_err(|_| ProtocolError::CryptoError)?;
-        let pass: Password = bincode::serde::decode_from_slice(&pass, bincode::config::legacy()).map_err(|_| ProtocolError::DataError)?.0;
+        let pass: Password = bincode::serde::decode_from_slice(&pass, bincode::config::legacy())
+            .map_err(|_| ProtocolError::DataError)?
+            .0;
         Ok(pass)
     }
 
     pub fn sign(&self, challenge: &[u8]) -> ResultP<[u8; ml_dsa_87::SIG_LEN]> {
-        self.di_q.clone().to_di().try_sign(challenge, &[])
+        let di_key = self.di_q.clone().to_di()?;
+        di_key
+            .try_sign(challenge, &[])
             .map_err(|_| ProtocolError::CryptoError)
     }
 
@@ -1101,7 +1132,8 @@ impl Client {
         if ciphertextsync.len() != 1568 {
             return Err(ProtocolError::DataError);
         }
-        let ci: &[u8; 1568] = ciphertextsync.try_into()
+        let ci: &[u8; 1568] = ciphertextsync
+            .try_into()
             .map_err(|_| ProtocolError::DataError)?;
         let cipher = MlKem1024Ciphertext::from(ci);
         let s = mlkem1024::decapsulate(&sk, &cipher);
@@ -1151,13 +1183,10 @@ impl Client {
         if kem_ct.len() != 1568 {
             return Err(ProtocolError::DataError);
         }
-        let kem_array: &[u8; 1568] = kem_ct.try_into()
-            .map_err(|_| ProtocolError::DataError)?;
+        let kem_array: &[u8; 1568] = kem_ct.try_into().map_err(|_| ProtocolError::DataError)?;
         let kem_cipher = MlKem1024Ciphertext::from(kem_array);
-        let shared_secret = mlkem1024::decapsulate(
-            &MlKem1024PrivateKey::from(&self.ky_q),
-            &kem_cipher,
-        );
+        let shared_secret =
+            mlkem1024::decapsulate(&MlKem1024PrivateKey::from(&self.ky_q), &kem_cipher);
 
         // Déchiffrer le mot de passe
         let hash = hash(&shared_secret);
@@ -1168,11 +1197,11 @@ impl Client {
             .decrypt(nonce, shared_pass.ep.ciphertext.as_slice())
             .map_err(|_| ProtocolError::CryptoError)?;
 
-        bincode::serde::decode_from_slice(&decrypted_bytes, bincode::config::legacy()).map(|(result, _)| result)
+        bincode::serde::decode_from_slice(&decrypted_bytes, bincode::config::legacy())
+            .map(|(result, _)| result)
             .map_err(|_| ProtocolError::DataError)
     }
 }
-
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Shards {
@@ -1188,7 +1217,8 @@ impl Shards {
     }
 
     pub fn recover(self) -> ResultP<Vec<u8>> {
-        let secret = sss_rs::prelude::reconstruct(&self.data, true).map_err(|_| ProtocolError::CryptoError)?;
+        let secret = sss_rs::prelude::reconstruct(&self.data, true)
+            .map_err(|_| ProtocolError::CryptoError)?;
         Ok(secret)
     }
 }
@@ -1203,10 +1233,9 @@ impl Server<RedisSecrets, PassesPostgres, RedisChallenges, UsersPostgres, Shared
         let users = UsersPostgres::new(postgres_url, file)
             .await
             .map_err(|_| ProtocolError::StorageError)?;
-        let secrets = RedisSecrets::new(redis_url)
-            .map_err(|_| ProtocolError::StorageError)?;
-        let challenges = RedisChallenges::new(redis_url)
-            .map_err(|_| ProtocolError::StorageError)?;
+        let secrets = RedisSecrets::new(redis_url).map_err(|_| ProtocolError::StorageError)?;
+        let challenges =
+            RedisChallenges::new(redis_url).map_err(|_| ProtocolError::StorageError)?;
         let shared_passes = SharedPassesPostgres::new(postgres_url, file)
             .await
             .map_err(|_| ProtocolError::StorageError)?;

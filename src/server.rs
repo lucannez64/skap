@@ -2,10 +2,9 @@ use crate::postgres::PassesPostgres;
 use crate::postgres::SharedPassesPostgres;
 use crate::postgres::UsersPostgres;
 use crate::protocol::ProtocolError;
-use crate::protocol::SharedPass;
-use crate::protocol::SharedByUser;
-use uuid::Uuid;
 use crate::protocol::Server as Server2;
+use crate::protocol::SharedByUser;
+use crate::protocol::SharedPass;
 use crate::protocol::CK;
 use crate::protocol::EP;
 use crate::redis::RedisChallenges;
@@ -21,8 +20,21 @@ use serde::Serialize;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 use warp::{reject, reply::Response, Filter, Rejection, Reply};
 
+// Constant-time string comparison to prevent timing attacks
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    let mut result = 0u8;
+    for (byte_a, byte_b) in a.bytes().zip(b.bytes()) {
+        result |= byte_a ^ byte_b;
+    }
+    result == 0
+}
 
 #[derive(Serialize)]
 struct ErrorMessage {
@@ -30,7 +42,7 @@ struct ErrorMessage {
     message: String,
 }
 
-#[derive(Clone, Debug,Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct PasswordsExtended {
     passwords: Vec<(EP, Uuid)>,
     shared_passes: Vec<(SharedPass, Uuid, Uuid)>,
@@ -68,15 +80,21 @@ impl ApiError {
             code,
             message: message.to_string(),
         });
-        warp::reply::with_status(json, warp::http::StatusCode::from_u16(code).unwrap())
-            .into_response()
+        warp::reply::with_status(
+            json,
+            warp::http::StatusCode::from_u16(code)
+                .unwrap_or(warp::http::StatusCode::INTERNAL_SERVER_ERROR),
+        )
+        .into_response()
     }
 
     fn create_binary_response(&self, code: u16, message: &str) -> Response {
-        let error_response = bincode::serde::encode_to_vec(&message, bincode::config::legacy()).unwrap_or_default();
+        let error_response =
+            bincode::serde::encode_to_vec(&message, bincode::config::legacy()).unwrap_or_default();
         warp::reply::with_status(
             warp::reply::Response::new(error_response.into()),
-            warp::http::StatusCode::from_u16(code).unwrap(),
+            warp::http::StatusCode::from_u16(code)
+                .unwrap_or(warp::http::StatusCode::INTERNAL_SERVER_ERROR),
         )
         .into_response()
     }
@@ -118,29 +136,37 @@ async fn auth_validation(
     if let Some(token) = token {
         let sk = sk.read().await;
         let validation = ClaimsValidationRules::new();
-        let untrusted_token = UntrustedToken::<Local, V4>::try_from(&token)
-        .map_err(|_| ApiError::Unauthorized("Invalid token format".to_string()).to_response(is_json))?;
+        let untrusted_token = UntrustedToken::<Local, V4>::try_from(&token).map_err(|_| {
+            ApiError::Unauthorized("Invalid token format".to_string()).to_response(is_json)
+        })?;
 
         let trusted_token = local::decrypt(&sk, &untrusted_token, &validation, None, Some(b"skap"))
-            .map_err(|_| ApiError::Unauthorized("Token validation failed".to_string()).to_response(is_json))?;
+            .map_err(|_| {
+                ApiError::Unauthorized("Token validation failed".to_string()).to_response(is_json)
+            })?;
 
-        let claims = trusted_token
-            .payload_claims()
-            .ok_or_else(|| ApiError::Unauthorized("No claims in token".to_string()).to_response(is_json))?;
+        let claims = trusted_token.payload_claims().ok_or_else(|| {
+            ApiError::Unauthorized("No claims in token".to_string()).to_response(is_json)
+        })?;
 
         let sub = claims
             .get_claim("sub")
-            .ok_or_else(|| ApiError::Unauthorized("No subject claim in token".to_string()).to_response(is_json))?
+            .ok_or_else(|| {
+                ApiError::Unauthorized("No subject claim in token".to_string()).to_response(is_json)
+            })?
             .as_str()
-            .ok_or_else(|| ApiError::Unauthorized("Invalid subject claim format".to_string()).to_response(is_json))?;
+            .ok_or_else(|| {
+                ApiError::Unauthorized("Invalid subject claim format".to_string())
+                    .to_response(is_json)
+            })?;
 
         let normalized_uuid = uuid.replace('-', "").replace('"', "");
         let normalized_sub = sub.replace('-', "").replace('"', "");
-        
-        if normalized_uuid == normalized_sub {
+
+        if constant_time_eq(&normalized_uuid, &normalized_sub) {
             Ok(())
         } else {
-            Err(ApiError::Unauthorized("UUID mismatch".to_string()).to_response(is_json))
+            Err(ApiError::Unauthorized("Authentication failed".to_string()).to_response(is_json))
         }
     } else {
         Err(ApiError::Unauthorized("No token".to_string()).to_response(is_json))
@@ -155,7 +181,8 @@ fn auth_error() -> Result<Response, Infallible> {
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL environment variable must be set")?;
 
     // Amélioration de la configuration des logs
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -174,11 +201,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .init();
 
-    let redis_url = std::env::var("REDIS_URL").expect("REDIS_URL must be set");
-    log::info!("Redis URL configured: {}", redis_url);
+    let redis_url =
+        std::env::var("REDIS_URL").map_err(|_| "REDIS_URL environment variable must be set")?;
+    log::info!("Redis URL configured");
 
-    let ca = std::env::var("CA_FILE").expect("CA must be set");
-    log::info!("CA file configured: {}", ca);
+    let ca = std::env::var("CA_FILE").map_err(|_| "CA_FILE environment variable must be set")?;
+    log::info!("CA file configured");
 
     log::info!("Creating server instance...");
     let server2 = Arc::new(RwLock::new(
@@ -218,13 +246,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )));
             }
         };
-        log::info!(
-            "Generated BASE64_KEY: {}",
-            base64::engine::general_purpose::STANDARD.encode(sk.as_bytes())
-        );
+        log::info!("Generated new BASE64_KEY");
     } else {
-        let base64k = std::env::var("BASE64_KEY").expect("BASE64_KEY must be set");
-        log::info!("Using provided BASE64_KEY (length: {})", base64k.len());
+        let base64k = std::env::var("BASE64_KEY")
+            .map_err(|_| "BASE64_KEY environment variable must be set")?;
+        log::info!("Using provided BASE64_KEY");
         let skbytes = match STANDARD.decode(&base64k) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -261,59 +287,57 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             |ck: CK, server2: ServerArc| async move { create_user_json_map(ck, &server2).await },
         );
 
-    let send_all =
-        warp::get()
-            .and(warp::path("send_all"))
-            .and(warp::path::param::<String>())
-            .and(server_filter.clone())
-            .and(mutexsk_filter.clone())
-            .and(cookies_filter.clone())
-            .and(header_filter.clone())
-            .and_then(
-                |uui: String,
-                 server2: ServerArc,
-                 sk: Arc<RwLock<SymmetricKey<V4>>>,
-                 token: Option<String>,
-                 header: Option<String>| async move {
-                    if let Some(token) = token {
-                        if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
-                            return Ok(response);
-                        }
-                    } else {
-                        if let Err(response) = auth_validation(sk, &uui, header, false).await {
-                            return Ok(response);
-                        }
+    let send_all = warp::get()
+        .and(warp::path("send_all"))
+        .and(warp::path::param::<String>())
+        .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and(header_filter.clone())
+        .and_then(
+            |uui: String,
+             server2: ServerArc,
+             sk: Arc<RwLock<SymmetricKey<V4>>>,
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
+                        return Ok(response);
                     }
-                    send_all_map(uui, &server2).await
-                },
-            );
+                } else {
+                    if let Err(response) = auth_validation(sk, &uui, header, false).await {
+                        return Ok(response);
+                    }
+                }
+                send_all_map(uui, &server2).await
+            },
+        );
 
-    let send_all_json =
-        warp::get()
-            .and(warp::path("send_all_json"))
-            .and(warp::path::param::<String>())
-            .and(server_filter.clone())
-            .and(mutexsk_filter.clone())
-            .and(cookies_filter.clone())
-            .and(header_filter.clone())
-            .and_then(
-                |uui: String,
-                 server2: ServerArc,
-                 sk: Arc<RwLock<SymmetricKey<V4>>>,
-                 token: Option<String>,
-                 header: Option<String>| async move {
-                    if let Some(token) = token {
-                        if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
-                            return Ok(response);
-                        }
-                    } else {
-                        if let Err(response) = auth_validation(sk, &uui, header, true).await {
-                            return Ok(response);
-                        }
+    let send_all_json = warp::get()
+        .and(warp::path("send_all_json"))
+        .and(warp::path::param::<String>())
+        .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and(header_filter.clone())
+        .and_then(
+            |uui: String,
+             server2: ServerArc,
+             sk: Arc<RwLock<SymmetricKey<V4>>>,
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
+                        return Ok(response);
                     }
-                    send_all_json_map(uui, &server2).await
-                },
-            );
+                } else {
+                    if let Err(response) = auth_validation(sk, &uui, header, true).await {
+                        return Ok(response);
+                    }
+                }
+                send_all_json_map(uui, &server2).await
+            },
+        );
 
     let create_user = warp::post()
         .and(warp::path("create_user"))
@@ -323,59 +347,57 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             create_user_map(body, &server2).await
         });
 
-    let sync_json =
-        warp::get()
-            .and(warp::path("sync_json"))
-            .and(warp::path::param::<String>())
-            .and(server_filter.clone())
-            .and(mutexsk_filter.clone())
-            .and(cookies_filter.clone())
-            .and(header_filter.clone())
-            .and_then(
-                |uui: String,
-                 server2: ServerArc,
-                 sk: Arc<RwLock<SymmetricKey<V4>>>,
-                 token: Option<String>,
-                 header: Option<String>| async move {
-                    if let Some(token) = token {
-                        if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
-                            return Ok(response);
-                        }
-                    } else {
-                        if let Err(response) = auth_validation(sk, &uui, header, true).await {
-                            return Ok(response);
-                        }
+    let sync_json = warp::get()
+        .and(warp::path("sync_json"))
+        .and(warp::path::param::<String>())
+        .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and(header_filter.clone())
+        .and_then(
+            |uui: String,
+             server2: ServerArc,
+             sk: Arc<RwLock<SymmetricKey<V4>>>,
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &uui, Some(token), true).await {
+                        return Ok(response);
                     }
-                    sync_json_map(uui, &server2).await
-                },
-            );
+                } else {
+                    if let Err(response) = auth_validation(sk, &uui, header, true).await {
+                        return Ok(response);
+                    }
+                }
+                sync_json_map(uui, &server2).await
+            },
+        );
 
-    let sync =
-        warp::get()
-            .and(warp::path("sync"))
-            .and(warp::path::param::<String>())
-            .and(server_filter.clone())
-            .and(mutexsk_filter.clone())
-            .and(cookies_filter.clone())
-            .and(header_filter.clone())
-            .and_then(
-                |uui: String,
-                 server2: ServerArc,
-                 sk: Arc<RwLock<SymmetricKey<V4>>>,
-                 token: Option<String>,
-                 header: Option<String>| async move {
-                    if let Some(token) = token {
-                        if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
-                            return Ok(response);
-                        }
-                    } else {
-                        if let Err(response) = auth_validation(sk, &uui, header, false).await {
-                            return Ok(response);
-                        }
+    let sync = warp::get()
+        .and(warp::path("sync"))
+        .and(warp::path::param::<String>())
+        .and(server_filter.clone())
+        .and(mutexsk_filter.clone())
+        .and(cookies_filter.clone())
+        .and(header_filter.clone())
+        .and_then(
+            |uui: String,
+             server2: ServerArc,
+             sk: Arc<RwLock<SymmetricKey<V4>>>,
+             token: Option<String>,
+             header: Option<String>| async move {
+                if let Some(token) = token {
+                    if let Err(response) = auth_validation(sk, &uui, Some(token), false).await {
+                        return Ok(response);
                     }
-                    sync_map(uui, &server2).await
-                },
-            );
+                } else {
+                    if let Err(response) = auth_validation(sk, &uui, header, false).await {
+                        return Ok(response);
+                    }
+                }
+                sync_map(uui, &server2).await
+            },
+        );
 
     let create_pass = warp::post()
         .and(warp::path("create_pass"))
@@ -793,7 +815,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &recipient, Some(token), false).await {
+                    if let Err(response) = auth_validation(sk, &recipient, Some(token), false).await
+                    {
                         return Ok(response);
                     }
                 } else {
@@ -823,7 +846,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
              token: Option<String>,
              header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &recipient, Some(token), true).await {
+                    if let Err(response) = auth_validation(sk, &recipient, Some(token), true).await
+                    {
                         return Ok(response);
                     }
                 } else {
@@ -839,25 +863,25 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path("get_uuid_from_email"))
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
-        .and_then(
-            |email: String, server2: ServerArc| async move {
-                get_uuid_from_email_map(email, &server2).await
-            },
-        );
+        .and_then(|email: String, server2: ServerArc| async move {
+            get_uuid_from_email_map(email, &server2).await
+        });
 
     let get_public_key = warp::get()
         .and(warp::path("get_public_key"))
         .and(warp::path::param::<String>())
         .and(server_filter.clone())
-        .and_then(
-            |id: String, server2: ServerArc| async move {
-                let id = match uuid::Uuid::parse_str(&id) {
-                    Ok(uuid) => uuid,
-                    Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
-                };
-                get_public_key_map(id, &server2).await
-            },
-        );
+        .and_then(|id: String, server2: ServerArc| async move {
+            let id = match uuid::Uuid::parse_str(&id) {
+                Ok(uuid) => uuid,
+                Err(_) => {
+                    return Ok(
+                        ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)
+                    )
+                }
+            };
+            get_public_key_map(id, &server2).await
+        });
 
     let get_shared_by_user = warp::get()
         .and(warp::path("get_shared_by_user"))
@@ -867,7 +891,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
-            |owner: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: Option<String>, header: Option<String>| async move {
+            |owner: String,
+             server2: ServerArc,
+             sk: Arc<RwLock<SymmetricKey<V4>>>,
+             token: Option<String>,
+             header: Option<String>| async move {
                 if let Some(token) = token {
                     if let Err(response) = auth_validation(sk, &owner, Some(token), false).await {
                         return Ok(response);
@@ -885,21 +913,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(warp::path("get_uuids_from_emails"))
         .and(warp::body::json())
         .and(server_filter.clone())
-        .and_then(
-            |emails: Vec<String>, server2: ServerArc| async move {
-                get_uuids_from_emails_map(emails, &server2).await
-            },
-        );
+        .and_then(|emails: Vec<String>, server2: ServerArc| async move {
+            get_uuids_from_emails_map(emails, &server2).await
+        });
 
     let get_emails_from_uuids = warp::post()
         .and(warp::path("get_emails_from_uuids"))
         .and(warp::body::json())
         .and(server_filter.clone())
-        .and_then(
-            |uuids: Vec<Uuid>, server2: ServerArc| async move {
-                get_emails_from_uuids_map(uuids, &server2).await
-            },
-        );
+        .and_then(|uuids: Vec<Uuid>, server2: ServerArc| async move {
+            get_emails_from_uuids_map(uuids, &server2).await
+        });
     let home = warp::get().and(warp::path::end()).and_then(|| async move {
         Ok::<warp::reply::Response, Infallible>(warp::reply::Response::new("Hello, world!".into()))
     });
@@ -914,9 +938,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
-            |recipient: String, owner: String, pass_id: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: Option<String>, header: Option<String>| async move {
+            |recipient: String,
+             owner: String,
+             pass_id: String,
+             server2: ServerArc,
+             sk: Arc<RwLock<SymmetricKey<V4>>>,
+             token: Option<String>,
+             header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &recipient, Some(token), false).await {
+                    if let Err(response) = auth_validation(sk, &recipient, Some(token), false).await
+                    {
                         return Ok(response);
                     }
                 } else {
@@ -938,9 +969,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
-            |recipient: String, owner: String, pass_id: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: Option<String>, header: Option<String>| async move {
+            |recipient: String,
+             owner: String,
+             pass_id: String,
+             server2: ServerArc,
+             sk: Arc<RwLock<SymmetricKey<V4>>>,
+             token: Option<String>,
+             header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &recipient, Some(token), true).await {
+                    if let Err(response) = auth_validation(sk, &recipient, Some(token), true).await
+                    {
                         return Ok(response);
                     }
                 } else {
@@ -962,9 +1000,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
-            |recipient: String, owner: String, pass_id: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: Option<String>, header: Option<String>| async move {
+            |recipient: String,
+             owner: String,
+             pass_id: String,
+             server2: ServerArc,
+             sk: Arc<RwLock<SymmetricKey<V4>>>,
+             token: Option<String>,
+             header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &recipient, Some(token), false).await {
+                    if let Err(response) = auth_validation(sk, &recipient, Some(token), false).await
+                    {
                         return Ok(response);
                     }
                 } else {
@@ -986,9 +1031,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
-            |recipient: String, owner: String, pass_id: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: Option<String>, header: Option<String>| async move {
+            |recipient: String,
+             owner: String,
+             pass_id: String,
+             server2: ServerArc,
+             sk: Arc<RwLock<SymmetricKey<V4>>>,
+             token: Option<String>,
+             header: Option<String>| async move {
                 if let Some(token) = token {
-                    if let Err(response) = auth_validation(sk, &recipient, Some(token), true).await {
+                    if let Err(response) = auth_validation(sk, &recipient, Some(token), true).await
+                    {
                         return Ok(response);
                     }
                 } else {
@@ -1010,7 +1062,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
-            |owner: String, pass_id: String, recipient: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: Option<String>, header: Option<String>| async move {
+            |owner: String,
+             pass_id: String,
+             recipient: String,
+             server2: ServerArc,
+             sk: Arc<RwLock<SymmetricKey<V4>>>,
+             token: Option<String>,
+             header: Option<String>| async move {
                 if let Some(token) = token {
                     if let Err(response) = auth_validation(sk, &owner, Some(token), false).await {
                         return Ok(response);
@@ -1033,7 +1091,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and(cookies_filter.clone())
         .and(header_filter.clone())
         .and_then(
-            |owner: String, pass_id: String, recipient: String, server2: ServerArc, sk: Arc<RwLock<SymmetricKey<V4>>>, token: Option<String>, header: Option<String>| async move {
+            |owner: String,
+             pass_id: String,
+             recipient: String,
+             server2: ServerArc,
+             sk: Arc<RwLock<SymmetricKey<V4>>>,
+             token: Option<String>,
+             header: Option<String>| async move {
                 if let Some(token) = token {
                     if let Err(response) = auth_validation(sk, &owner, Some(token), true).await {
                         return Ok(response);
@@ -1111,7 +1175,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn get_uuid_from_email_map(email: String, server2: &ServerArc) -> Result<Response, Infallible> {
+async fn get_uuid_from_email_map(
+    email: String,
+    server2: &ServerArc,
+) -> Result<Response, Infallible> {
     let server = server2.read().await;
     let uuid = server.get_uuid_from_email(email).await;
     if let Ok(uuid) = uuid {
@@ -1121,7 +1188,10 @@ async fn get_uuid_from_email_map(email: String, server2: &ServerArc) -> Result<R
     }
 }
 
-async fn get_uuids_from_emails_map(emails: Vec<String>, server2: &ServerArc) -> Result<Response, Infallible> {
+async fn get_uuids_from_emails_map(
+    emails: Vec<String>,
+    server2: &ServerArc,
+) -> Result<Response, Infallible> {
     let server = server2.read().await;
     let uuids = server.get_uuids_from_emails(emails).await;
     if let Ok(uuids) = uuids {
@@ -1131,57 +1201,84 @@ async fn get_uuids_from_emails_map(emails: Vec<String>, server2: &ServerArc) -> 
     }
 }
 
-async fn get_shared_pass_status_map(owner: String, pass_id: String, recipient: String, server2: &ServerArc) -> Result<Response, Infallible> {
+async fn get_shared_pass_status_map(
+    owner: String,
+    pass_id: String,
+    recipient: String,
+    server2: &ServerArc,
+) -> Result<Response, Infallible> {
     let server = server2.read().await;
     let owner = match uuid::Uuid::parse_str(&owner) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false))
+        }
     };
     let pass_id = match uuid::Uuid::parse_str(&pass_id) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false))
+        }
     };
     let recipient = match uuid::Uuid::parse_str(&recipient) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false))
+        }
     };
-    let status = server.get_shared_pass_status(owner, pass_id, recipient).await;
+    let status = server
+        .get_shared_pass_status(owner, pass_id, recipient)
+        .await;
     if let Ok(status) = status {
-        Ok(warp::reply::Response::new(bincode::serde::encode_to_vec(&status, bincode::config::legacy()).unwrap().into()))
+        Ok(warp::reply::Response::new(
+            bincode::serde::encode_to_vec(&status, bincode::config::legacy())
+                .unwrap()
+                .into(),
+        ))
     } else {
         Ok(ApiError::BadRequest("Failed to get shared pass status".to_string()).to_response(false))
     }
 }
 
-async fn get_shared_pass_status_json_map(owner: String, pass_id: String, recipient: String, server2: &ServerArc) -> Result<Response, Infallible> {
+async fn get_shared_pass_status_json_map(
+    owner: String,
+    pass_id: String,
+    recipient: String,
+    server2: &ServerArc,
+) -> Result<Response, Infallible> {
     let server = server2.read().await;
     let owner = match uuid::Uuid::parse_str(&owner) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true))
+        }
     };
     let pass_id = match uuid::Uuid::parse_str(&pass_id) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true))
+        }
     };
     let recipient = match uuid::Uuid::parse_str(&recipient) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true))
+        }
     };
-    let status = server.get_shared_pass_status(owner, pass_id, recipient).await;
+    let status = server
+        .get_shared_pass_status(owner, pass_id, recipient)
+        .await;
     if let Ok(status) = status {
-        Ok(warp::reply::json(&status).into_response())  
+        Ok(warp::reply::json(&status).into_response())
     } else {
         Ok(ApiError::BadRequest("Failed to get shared pass status".to_string()).to_response(true))
     }
 }
 
-
-
-
-
-
-
-async fn get_emails_from_uuids_map(uuids: Vec<Uuid>, server2: &ServerArc) -> Result<Response, Infallible> {
+async fn get_emails_from_uuids_map(
+    uuids: Vec<Uuid>,
+    server2: &ServerArc,
+) -> Result<Response, Infallible> {
     let server = server2.read().await;
     let emails = server.get_emails_from_uuids(uuids).await;
     if let Ok(emails) = emails {
@@ -1201,11 +1298,16 @@ async fn get_public_key_map(id: Uuid, server2: &ServerArc) -> Result<Response, I
     }
 }
 
-async fn get_shared_by_user_map(owner: String, server2: &ServerArc) -> Result<Response, Infallible> {
+async fn get_shared_by_user_map(
+    owner: String,
+    server2: &ServerArc,
+) -> Result<Response, Infallible> {
     let server = server2.read().await;
     let owner = match uuid::Uuid::parse_str(&owner) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false))
+        }
     };
     let shared_by_user = server.get_shared_by_user(owner).await;
     if let Ok(shared_by_user) = shared_by_user {
@@ -1215,40 +1317,66 @@ async fn get_shared_by_user_map(owner: String, server2: &ServerArc) -> Result<Re
     }
 }
 
-async fn accept_shared_pass_map(recipient: String, owner: String, pass_id: String, server2: &ServerArc) -> Result<Response, Infallible> {
+async fn accept_shared_pass_map(
+    recipient: String,
+    owner: String,
+    pass_id: String,
+    server2: &ServerArc,
+) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let recipient = match uuid::Uuid::parse_str(&recipient) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false))
+        }
     };
     let owner = match uuid::Uuid::parse_str(&owner) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false))
+        }
     };
     let pass_id = match uuid::Uuid::parse_str(&pass_id) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false))
+        }
     };
     let shared_pass = server.accept_shared_pass(owner, pass_id, recipient).await;
     if let Err(e) = shared_pass {
         return Ok(ApiError::BadRequest(e.to_string()).to_response(false));
     }
-    Ok(warp::reply::Response::new(bincode::serde::encode_to_vec(&"OK", bincode::config::legacy()).unwrap().into()))
+    Ok(warp::reply::Response::new(
+        bincode::serde::encode_to_vec(&"OK", bincode::config::legacy())
+            .unwrap()
+            .into(),
+    ))
 }
 
-async fn accept_shared_pass_json_map(recipient: String, owner: String, pass_id: String, server2: &ServerArc) -> Result<Response, Infallible> {
+async fn accept_shared_pass_json_map(
+    recipient: String,
+    owner: String,
+    pass_id: String,
+    server2: &ServerArc,
+) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let recipient = match uuid::Uuid::parse_str(&recipient) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true))
+        }
     };
     let owner = match uuid::Uuid::parse_str(&owner) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true))
+        }
     };
     let pass_id = match uuid::Uuid::parse_str(&pass_id) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true))
+        }
     };
     let shared_pass = server.accept_shared_pass(owner, pass_id, recipient).await;
     if let Err(e) = shared_pass {
@@ -1257,40 +1385,66 @@ async fn accept_shared_pass_json_map(recipient: String, owner: String, pass_id: 
     Ok(warp::reply::json(&"OK").into_response())
 }
 
-async fn reject_shared_pass_map(recipient: String, owner: String, pass_id: String, server2: &ServerArc) -> Result<Response, Infallible> {
+async fn reject_shared_pass_map(
+    recipient: String,
+    owner: String,
+    pass_id: String,
+    server2: &ServerArc,
+) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let recipient = match uuid::Uuid::parse_str(&recipient) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false))
+        }
     };
     let owner = match uuid::Uuid::parse_str(&owner) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false))
+        }
     };
     let pass_id = match uuid::Uuid::parse_str(&pass_id) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(false))
+        }
     };
     let shared_pass = server.reject_shared_pass(owner, pass_id, recipient).await;
     if let Err(e) = shared_pass {
         return Ok(ApiError::BadRequest(e.to_string()).to_response(false));
     }
-    Ok(warp::reply::Response::new(bincode::serde::encode_to_vec(&"OK", bincode::config::legacy()).unwrap().into()))
+    Ok(warp::reply::Response::new(
+        bincode::serde::encode_to_vec(&"OK", bincode::config::legacy())
+            .unwrap()
+            .into(),
+    ))
 }
 
-async fn reject_shared_pass_json_map(recipient: String, owner: String, pass_id: String, server2: &ServerArc) -> Result<Response, Infallible> {
+async fn reject_shared_pass_json_map(
+    recipient: String,
+    owner: String,
+    pass_id: String,
+    server2: &ServerArc,
+) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let recipient = match uuid::Uuid::parse_str(&recipient) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true))
+        }
     };
     let owner = match uuid::Uuid::parse_str(&owner) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true))
+        }
     };
     let pass_id = match uuid::Uuid::parse_str(&pass_id) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true))
+        }
     };
     let shared_pass = server.reject_shared_pass(owner, pass_id, recipient).await;
     if let Err(e) = shared_pass {
@@ -1310,7 +1464,8 @@ async fn delete_map(
         Ok(uuid) => uuid,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for user ID".to_string()).to_response(false),
+                ApiError::BadRequest("Invalid UUID format for user ID".to_string())
+                    .to_response(false),
             )
         }
     };
@@ -1318,7 +1473,8 @@ async fn delete_map(
         Ok(uuid2) => uuid2,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(false),
+                ApiError::BadRequest("Invalid UUID format for pass ID".to_string())
+                    .to_response(false),
             )
         }
     };
@@ -1346,7 +1502,8 @@ async fn delete_json_map(
         Ok(uuid) => uuid,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for user ID".to_string()).to_response(true),
+                ApiError::BadRequest("Invalid UUID format for user ID".to_string())
+                    .to_response(true),
             )
         }
     };
@@ -1355,14 +1512,17 @@ async fn delete_json_map(
         Ok(uuid2) => uuid2,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true),
+                ApiError::BadRequest("Invalid UUID format for pass ID".to_string())
+                    .to_response(true),
             )
         }
     };
 
     match server.delete_pass(id, id2).await {
         Ok(()) => Ok(warp::reply::json(&"Pass deleted successfully").into_response()),
-        Err(_) => Ok(ApiError::InternalError("Failed to delete pass".to_string()).to_response(true)),
+        Err(_) => {
+            Ok(ApiError::InternalError("Failed to delete pass".to_string()).to_response(true))
+        }
     }
 }
 
@@ -1373,13 +1533,15 @@ async fn challenge_map(uui: String, server2: &ServerArc) -> Result<Response, Inf
         Ok(uuid) => uuid,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(false),
+                ApiError::BadRequest("Invalid UUID format for pass ID".to_string())
+                    .to_response(false),
             )
         }
     };
 
     match server.challenge(id).await {
-        Ok(challenge) => match bincode::serde::encode_to_vec(&challenge, bincode::config::legacy()) {
+        Ok(challenge) => match bincode::serde::encode_to_vec(&challenge, bincode::config::legacy())
+        {
             Ok(a) => return Ok(warp::reply::Response::new(a.into())),
             Err(_) => {
                 return Ok(
@@ -1389,13 +1551,11 @@ async fn challenge_map(uui: String, server2: &ServerArc) -> Result<Response, Inf
             }
         },
         Err(ProtocolError::UserNotFound) => {
-            return Ok(
-                ApiError::BadRequest("User not found".to_string()).to_response(false),
-            )
+            return Ok(ApiError::BadRequest("User not found".to_string()).to_response(false))
         }
-        Err(_) => {
-            Ok(ApiError::InternalError("Failed to generate challenge".to_string()).to_response(false))
-        }
+        Err(_) => Ok(
+            ApiError::InternalError("Failed to generate challenge".to_string()).to_response(false),
+        ),
     }
 }
 
@@ -1404,17 +1564,19 @@ async fn challenge_json_map(uui: String, server2: &ServerArc) -> Result<Response
 
     let id = match uuid::Uuid::parse_str(&uui) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true))
+        }
     };
 
     match server.challenge(id).await {
         Ok(challenge) => Ok(warp::reply::json(&challenge).into_response()),
         Err(ProtocolError::UserNotFound) => {
-            return Ok(
-                ApiError::BadRequest("User not found".to_string()).to_response(true),
-            )
+            return Ok(ApiError::BadRequest("User not found".to_string()).to_response(true))
         }
-        Err(_) => Ok(ApiError::InternalError("Failed to generate challenge".to_string()).to_response(true)),
+        Err(_) => Ok(
+            ApiError::InternalError("Failed to generate challenge".to_string()).to_response(true),
+        ),
     }
 }
 
@@ -1431,10 +1593,11 @@ async fn verify_map(
         Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).into()),
     };
 
-    let proof = match bincode::serde::decode_from_slice::<Vec<u8>, _>(&body, bincode::config::legacy()) {
-        Ok((proof, _)) => proof,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid proof format".to_string()).into()),
-    };
+    let proof =
+        match bincode::serde::decode_from_slice::<Vec<u8>, _>(&body, bincode::config::legacy()) {
+            Ok((proof, _)) => proof,
+            Err(_) => return Ok(ApiError::BadRequest("Invalid proof format".to_string()).into()),
+        };
 
     match server.verify(id.clone(), &proof).await {
         Ok(_) => {
@@ -1485,7 +1648,9 @@ async fn verify_json_map(
 
     let id = match uuid::Uuid::parse_str(&uui) {
         Ok(id) => id,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true))
+        }
     };
 
     match server.verify(id.clone(), body.as_slice()).await {
@@ -1512,7 +1677,8 @@ async fn verify_json_map(
                 Ok(token) => token,
                 Err(_) => {
                     return Ok(
-                        ApiError::InternalError("Failed to create token".to_string()).to_response(true),
+                        ApiError::InternalError("Failed to create token".to_string())
+                            .to_response(true),
                     )
                 }
             };
@@ -1527,9 +1693,9 @@ async fn verify_json_map(
             )
             .into_response())
         }
-        Err(_) => {
-            Ok(ApiError::AuthenticationFailed("Authentication failed".to_string()).to_response(true))
-        }
+        Err(_) => Ok(
+            ApiError::AuthenticationFailed("Authentication failed".to_string()).to_response(true),
+        ),
     }
 }
 
@@ -1577,20 +1743,28 @@ async fn update_pass_json_map(
     let id = match uuid::Uuid::parse_str(&uui) {
         Ok(uuid) => uuid,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for user ID".to_string()).to_response(true))
+            return Ok(
+                ApiError::BadRequest("Invalid UUID format for user ID".to_string())
+                    .to_response(true),
+            )
         }
     };
 
     let id2 = match uuid::Uuid::parse_str(&uui2) {
         Ok(uuid2) => uuid2,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true))
+            return Ok(
+                ApiError::BadRequest("Invalid UUID format for pass ID".to_string())
+                    .to_response(true),
+            )
         }
     };
 
     match server.update_pass(id, id2, pass).await {
         Ok(()) => Ok(warp::reply::json(&id2).into_response()),
-        Err(_) => Ok(ApiError::InternalError("Failed to update pass".to_string()).to_response(true)),
+        Err(_) => {
+            Ok(ApiError::InternalError("Failed to update pass".to_string()).to_response(true))
+        }
     }
 }
 
@@ -1602,18 +1776,17 @@ async fn send_map(uui: String, uui2: String, server2: &ServerArc) -> Result<Resp
         return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).into());
     }
     match server.send(id.unwrap(), id2.unwrap()).await {
-        Ok(r) => {
-            Ok(warp::reply::Response::new(bincode::serde::encode_to_vec(&r, bincode::config::legacy()).unwrap().into()).into_response())
-        }
+        Ok(r) => Ok(warp::reply::Response::new(
+            bincode::serde::encode_to_vec(&r, bincode::config::legacy())
+                .unwrap()
+                .into(),
+        )
+        .into_response()),
         Err(ProtocolError::UserNotFound) => {
-            return Ok(
-                ApiError::BadRequest("User not found".to_string()).to_response(false),
-            )
+            return Ok(ApiError::BadRequest("User not found".to_string()).to_response(false))
         }
         Err(ProtocolError::PassNotFound) => {
-            return Ok(
-                ApiError::BadRequest("Pass not found".to_string()).to_response(false),
-            )
+            return Ok(ApiError::BadRequest("Pass not found".to_string()).to_response(false))
         }
         Err(_) => Ok(ApiError::InternalError("Failed to send pass".to_string()).into()),
     }
@@ -1629,28 +1802,30 @@ async fn send_json_map(
     let id = match uuid::Uuid::parse_str(&uui) {
         Ok(uuid) => uuid,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for user ID".to_string()).to_response(true))
+            return Ok(
+                ApiError::BadRequest("Invalid UUID format for user ID".to_string())
+                    .to_response(true),
+            )
         }
     };
 
     let id2 = match uuid::Uuid::parse_str(&uui2) {
         Ok(uuid2) => uuid2,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true))
+            return Ok(
+                ApiError::BadRequest("Invalid UUID format for pass ID".to_string())
+                    .to_response(true),
+            )
         }
     };
 
     match server.send(id, id2).await {
         Ok(r) => Ok(warp::reply::json(&r).into_response()),
         Err(ProtocolError::UserNotFound) => {
-            return Ok(
-                ApiError::BadRequest("User not found".to_string()).to_response(true),
-            )
+            return Ok(ApiError::BadRequest("User not found".to_string()).to_response(true))
         }
         Err(ProtocolError::PassNotFound) => {
-            return Ok(
-                ApiError::BadRequest("Pass not found".to_string()).to_response(true),
-            )
+            return Ok(ApiError::BadRequest("Pass not found".to_string()).to_response(true))
         }
         Err(_) => Ok(ApiError::InternalError("Failed to send pass".to_string()).to_response(true)),
     }
@@ -1663,14 +1838,18 @@ async fn create_pass_map(
 ) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
     let id = uuid::Uuid::parse_str(&uui);
-    let ep = bincode::serde::decode_from_slice::<EP, _>(&pass, bincode::config::legacy()).map(|(ep, _)| ep);
+    let ep = bincode::serde::decode_from_slice::<EP, _>(&pass, bincode::config::legacy())
+        .map(|(ep, _)| ep);
     if id.is_err() || ep.is_err() {
         return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).into());
     }
     match server.create_pass(id.unwrap(), ep.unwrap()).await {
-        Ok(id2) => Ok(
-            warp::reply::Response::new(bincode::serde::encode_to_vec(&id2, bincode::config::legacy()).unwrap().into()).into_response(),
-        ),
+        Ok(id2) => Ok(warp::reply::Response::new(
+            bincode::serde::encode_to_vec(&id2, bincode::config::legacy())
+                .unwrap()
+                .into(),
+        )
+        .into_response()),
         Err(_) => Ok(ApiError::InternalError("Failed to create pass".to_string()).into()),
     }
 }
@@ -1683,7 +1862,9 @@ async fn create_pass_json_map(
     let mut server = server2.write().await;
     let id = match uuid::Uuid::parse_str(&uui) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true))
+        }
     };
 
     match server.create_pass(id, pass).await {
@@ -1703,7 +1884,9 @@ async fn sync_map(uui: String, server2: &ServerArc) -> Result<Response, Infallib
     }
     match server.sync(id.unwrap()).await {
         Ok(ciphertextsync) => Ok(warp::reply::Response::new(
-            bincode::serde::encode_to_vec(&ciphertextsync.to_vec(), bincode::config::legacy()).unwrap().into(),
+            bincode::serde::encode_to_vec(&ciphertextsync.to_vec(), bincode::config::legacy())
+                .unwrap()
+                .into(),
         )),
         Err(_) => Ok(ApiError::InternalError("Failed to sync data".to_string()).into()),
     }
@@ -1714,7 +1897,9 @@ async fn sync_json_map(uui: String, server2: &ServerArc) -> Result<Response, Inf
 
     let id = match uuid::Uuid::parse_str(&uui) {
         Ok(uuid) => uuid,
-        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true)),
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).to_response(true))
+        }
     };
 
     match server.sync(id).await {
@@ -1786,7 +1971,9 @@ async fn create_user_json_map(mut ck: CK, server2: &ServerArc) -> Result<Respons
             ck.id = Some(uuid);
             Ok(warp::reply::json(&ck).into_response())
         }
-        Err(_) => Ok(ApiError::InternalError("Failed to create user".to_string()).to_response(true)),
+        Err(_) => {
+            Ok(ApiError::InternalError("Failed to create user".to_string()).to_response(true))
+        }
     }
 }
 
@@ -1797,9 +1984,12 @@ async fn send_all_map(uui: String, server2: &ServerArc) -> Result<Response, Infa
     }
     let server = server2.read().await;
     match server.send_all(id.unwrap()).await {
-        Ok(r) => {
-            Ok(warp::reply::Response::new(bincode::serde::encode_to_vec(&r, bincode::config::legacy()).unwrap().into()).into_response())
-        }
+        Ok(r) => Ok(warp::reply::Response::new(
+            bincode::serde::encode_to_vec(&r, bincode::config::legacy())
+                .unwrap()
+                .into(),
+        )
+        .into_response()),
         Err(_) => Ok(ApiError::InternalError("Failed to send pass".to_string()).into()),
     }
 }
@@ -1807,7 +1997,9 @@ async fn send_all_map(uui: String, server2: &ServerArc) -> Result<Response, Infa
 async fn send_all_json_map(uui: String, server2: &ServerArc) -> Result<Response, Infallible> {
     let id = uuid::Uuid::parse_str(&uui);
     if id.is_err() {
-        return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true));
+        return Ok(
+            ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true),
+        );
     }
     let server = server2.read().await;
     match server.send_all(id.clone().unwrap()).await {
@@ -1861,7 +2053,10 @@ async fn share_pass_map(
         Err(response) => return Ok(response),
     };
 
-    let shared_pass = match bincode::serde::decode_from_slice::<crate::protocol::SharedPass, _>(&shared_pass, bincode::config::legacy()) {
+    let shared_pass = match bincode::serde::decode_from_slice::<crate::protocol::SharedPass, _>(
+        &shared_pass,
+        bincode::config::legacy(),
+    ) {
         Ok((pass, _)) => pass,
         Err(_) => {
             return Ok(ApiError::BadRequest("Invalid shared pass data format".to_string()).into())
@@ -1873,9 +2068,12 @@ async fn share_pass_map(
         .await
     {
         Ok(()) => Ok(warp::reply::Response::new(
-            bincode::serde::encode_to_vec(&"Password shared successfully", bincode::config::legacy())
-                .unwrap()
-                .into(),
+            bincode::serde::encode_to_vec(
+                &"Password shared successfully",
+                bincode::config::legacy(),
+            )
+            .unwrap()
+            .into(),
         )),
         Err(_) => Ok(ApiError::InternalError("Failed to share password".to_string()).into()),
     }
@@ -1947,9 +2145,12 @@ async fn unshare_pass_map(
 
     match server.unshare_pass(owner_id, pass_uuid, recipient_id).await {
         Ok(()) => Ok(warp::reply::Response::new(
-            bincode::serde::encode_to_vec(&"Password unshared successfully", bincode::config::legacy())
-                .unwrap()
-                .into(),
+            bincode::serde::encode_to_vec(
+                &"Password unshared successfully",
+                bincode::config::legacy(),
+            )
+            .unwrap()
+            .into(),
         )),
         Err(_) => Ok(ApiError::InternalError("Failed to unshare password".to_string()).into()),
     }
@@ -1966,14 +2167,20 @@ async fn unshare_pass_json_map(
     let owner_id = match uuid::Uuid::parse_str(&owner) {
         Ok(uuid) => uuid,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for owner ID".to_string()).to_response(true))
+            return Ok(
+                ApiError::BadRequest("Invalid UUID format for owner ID".to_string())
+                    .to_response(true),
+            )
         }
     };
 
     let pass_uuid = match uuid::Uuid::parse_str(&pass_id) {
         Ok(uuid) => uuid,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true))
+            return Ok(
+                ApiError::BadRequest("Invalid UUID format for pass ID".to_string())
+                    .to_response(true),
+            )
         }
     };
 
@@ -1981,7 +2188,8 @@ async fn unshare_pass_json_map(
         Ok(uuid) => uuid,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for recipient ID".to_string()).to_response(true)
+                ApiError::BadRequest("Invalid UUID format for recipient ID".to_string())
+                    .to_response(true),
             )
         }
     };
@@ -2028,7 +2236,9 @@ async fn get_shared_pass_map(
         .await
     {
         Ok(shared_pass) => Ok(warp::reply::Response::new(
-            bincode::serde::encode_to_vec(&shared_pass, bincode::config::legacy()).unwrap().into(),
+            bincode::serde::encode_to_vec(&shared_pass, bincode::config::legacy())
+                .unwrap()
+                .into(),
         )),
         Err(_) => Ok(ApiError::InternalError("Failed to get shared password".to_string()).into()),
     }
@@ -2046,7 +2256,8 @@ async fn get_shared_pass_json_map(
         Ok(uuid) => uuid,
         Err(_) => {
             return Ok(
-                ApiError::BadRequest("Invalid UUID format for recipient ID".to_string()).to_response(true)
+                ApiError::BadRequest("Invalid UUID format for recipient ID".to_string())
+                    .to_response(true),
             )
         }
     };
@@ -2054,14 +2265,20 @@ async fn get_shared_pass_json_map(
     let owner_id = match uuid::Uuid::parse_str(&owner) {
         Ok(uuid) => uuid,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for owner ID".to_string()).to_response(true))
+            return Ok(
+                ApiError::BadRequest("Invalid UUID format for owner ID".to_string())
+                    .to_response(true),
+            )
         }
     };
 
     let pass_uuid = match uuid::Uuid::parse_str(&pass_id) {
         Ok(uuid) => uuid,
         Err(_) => {
-            return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).to_response(true))
+            return Ok(
+                ApiError::BadRequest("Invalid UUID format for pass ID".to_string())
+                    .to_response(true),
+            )
         }
     };
 

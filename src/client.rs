@@ -1,5 +1,9 @@
 use crate::protocol::*;
-use reqwest::{cookie::Jar, header::{HeaderValue, COOKIE}, Url};
+use reqwest::{
+    cookie::Jar,
+    header::{HeaderValue, COOKIE},
+    Url,
+};
 use reqwest_cookie_store::RawCookie;
 use uuid::Uuid;
 
@@ -8,24 +12,24 @@ const BASE_URL: &str = "https://127.0.0.1:3030/";
 pub async fn new(client2: &reqwest::Client, email: &str) -> ResultP<(Client, CK)> {
     let client = crate::protocol::Client::new()?;
     let ck = CK::new(client.ky_p, client.di_p.clone(), email.to_string());
-    
+
     let serialized_ck = bincode::serde::encode_to_vec(&ck, bincode::config::legacy())
         .map_err(|_| ProtocolError::DataError)?;
-    
+
     let res = client2
         .post(BASE_URL.to_string() + "create_user/")
         .body(serialized_ck)
         .send()
         .await
         .map_err(|_| ProtocolError::DataError)?;
-    
-    let bytes = res.bytes()
-        .await
-        .map_err(|_| ProtocolError::DataError)?;
-    
-    let deserialized_ck = bincode::serde::decode_from_slice::<CK>(&bytes, bincode::config::legacy())
-        .map_err(|_| ProtocolError::DataError)?.0;
-    
+
+    let bytes = res.bytes().await.map_err(|_| ProtocolError::DataError)?;
+
+    let deserialized_ck =
+        bincode::serde::decode_from_slice::<CK>(&bytes, bincode::config::legacy())
+            .map_err(|_| ProtocolError::DataError)?
+            .0;
+
     Ok((client, deserialized_ck))
 }
 
@@ -41,55 +45,51 @@ pub async fn auth(
         .send()
         .await
         .map_err(|_| ProtocolError::DataError)?;
-    
-    let chall = res.bytes()
-        .await
-        .map_err(|_| ProtocolError::DataError)?;
-    
+
+    let chall = res.bytes().await.map_err(|_| ProtocolError::DataError)?;
+
     // Signer le challenge
     let sign = client.sign(&chall);
-    
+
     // Vérifier la signature
     let serialized_sign = bincode::serde::encode_to_vec(sign.as_slice(), bincode::config::legacy())
         .map_err(|_| ProtocolError::DataError)?;
-    
+
     let res = client2
         .post(BASE_URL.to_string() + "verify/" + uuid.to_string().as_str() + "/")
         .body(serialized_sign)
         .send()
         .await
         .map_err(|_| ProtocolError::DataError)?;
-    
+
     // Récupérer le cookie
-    let c = jar.read()
-        .map_err(|_| ProtocolError::DataError)?;
-    
+    let c = jar.read().map_err(|_| ProtocolError::DataError)?;
+
     let cookies = c.iter_any().collect::<Vec<_>>();
     if cookies.is_empty() {
         return Err(ProtocolError::AuthError);
     }
-    
+
     let cookie = format!("token={}", cookies[0].value().replace("\"", ""));
-    
+
     // Synchroniser
     let syncr = client2
         .get(BASE_URL.to_string() + "sync/" + uuid.to_string().as_str() + "/")
-        .header(COOKIE, HeaderValue::from_str(cookie.as_str())
-            .map_err(|_| ProtocolError::DataError)?);
-    
-    let sync = syncr.send()
-        .await
-        .map_err(|_| ProtocolError::DataError)?;
-    
-    let d = sync.bytes()
-        .await
-        .map_err(|_| ProtocolError::DataError)?;
-    
+        .header(
+            COOKIE,
+            HeaderValue::from_str(cookie.as_str()).map_err(|_| ProtocolError::DataError)?,
+        );
+
+    let sync = syncr.send().await.map_err(|_| ProtocolError::DataError)?;
+
+    let d = sync.bytes().await.map_err(|_| ProtocolError::DataError)?;
+
     let dd = bincode::serde::decode_from_slice::<&[u8]>(&d, bincode::config::legacy())
-        .map_err(|_| ProtocolError::DataError)?.0;
-    
+        .map_err(|_| ProtocolError::DataError)?
+        .0;
+
     client.sync(dd)?;
-    
+
     Ok(())
 }
 
@@ -102,35 +102,35 @@ pub async fn create_pass(
 ) -> ResultP<Uuid> {
     let encrypted = client.encrypt(pass.clone())?;
     let eq = client.send(encrypted)?;
-    
-    let c = jar.read()
-        .map_err(|_| ProtocolError::DataError)?;
-    
+
+    let c = jar.read().map_err(|_| ProtocolError::DataError)?;
+
     let cookies = c.iter_any().collect::<Vec<_>>();
     if cookies.is_empty() {
         return Err(ProtocolError::AuthError);
     }
-    
+
     let cookie = format!("token={}", cookies[0].value().replace("\"", ""));
-    
+
     let serialized_eq = bincode::serde::encode_to_vec(&eq, bincode::config::legacy())
         .map_err(|_| ProtocolError::DataError)?;
-    
+
     let res = client2
         .post(BASE_URL.to_string() + "create_pass/" + uuid.to_string().as_str() + "/")
-        .header(COOKIE, HeaderValue::from_str(cookie.as_str())
-            .map_err(|_| ProtocolError::DataError)?)
+        .header(
+            COOKIE,
+            HeaderValue::from_str(cookie.as_str()).map_err(|_| ProtocolError::DataError)?,
+        )
         .body(serialized_eq)
         .send()
         .await
         .map_err(|_| ProtocolError::DataError)?;
-    
-    let bytes = res.bytes()
-        .await
-        .map_err(|_| ProtocolError::DataError)?;
-    
+
+    let bytes = res.bytes().await.map_err(|_| ProtocolError::DataError)?;
+
     bincode::serde::decode_from_slice::<Uuid>(&bytes, bincode::config::legacy())
-        .map_err(|_| ProtocolError::DataError).map(|(result, _)| result)
+        .map_err(|_| ProtocolError::DataError)
+        .map(|(result, _)| result)
 }
 
 pub async fn update_pass(
@@ -143,20 +143,19 @@ pub async fn update_pass(
 ) -> ResultP<Uuid> {
     let encrypted = client.encrypt(pass.clone())?;
     let eq = client.send(encrypted)?;
-    
-    let c = jar.read()
-        .map_err(|_| ProtocolError::DataError)?;
-    
+
+    let c = jar.read().map_err(|_| ProtocolError::DataError)?;
+
     let cookies = c.iter_any().collect::<Vec<_>>();
     if cookies.is_empty() {
         return Err(ProtocolError::AuthError);
     }
-    
+
     let cookie = format!("token={}", cookies[0].value().replace("\"", ""));
-    
+
     let serialized_eq = bincode::serde::encode_to_vec(&eq, bincode::config::legacy())
         .map_err(|_| ProtocolError::DataError)?;
-    
+
     let res = client2
         .post(
             BASE_URL.to_string()
@@ -166,19 +165,20 @@ pub async fn update_pass(
                 + uuid2.to_string().as_str()
                 + "/",
         )
-        .header(COOKIE, HeaderValue::from_str(cookie.as_str())
-            .map_err(|_| ProtocolError::DataError)?)
+        .header(
+            COOKIE,
+            HeaderValue::from_str(cookie.as_str()).map_err(|_| ProtocolError::DataError)?,
+        )
         .body(serialized_eq)
         .send()
         .await
         .map_err(|_| ProtocolError::DataError)?;
-    
-    let bytes = res.bytes()
-        .await
-        .map_err(|_| ProtocolError::DataError)?;
-    
+
+    let bytes = res.bytes().await.map_err(|_| ProtocolError::DataError)?;
+
     bincode::serde::decode_from_slice::<Uuid>(&bytes, bincode::config::legacy())
-        .map_err(|_| ProtocolError::DataError).map(|(result, _)| result)
+        .map_err(|_| ProtocolError::DataError)
+        .map(|(result, _)| result)
 }
 
 pub async fn get_all(
@@ -187,17 +187,16 @@ pub async fn get_all(
     client: &mut Client,
     jar: std::sync::Arc<reqwest_cookie_store::CookieStoreRwLock>,
 ) -> ResultP<(Vec<(Password, Uuid)>, Vec<(Password, Uuid, Uuid)>)> {
-    let c = jar.read()
-        .map_err(|_| ProtocolError::DataError)?;
-    
+    let c = jar.read().map_err(|_| ProtocolError::DataError)?;
+
     let cookies = c.iter_any().collect::<Vec<_>>();
     if cookies.is_empty() {
         return Err(ProtocolError::AuthError);
     }
-    
+
     let cookie = format!("token={}", cookies[0].value().replace("\"", ""));
-    let cookie_header = HeaderValue::from_str(cookie.as_str())
-        .map_err(|_| ProtocolError::DataError)?;
+    let cookie_header =
+        HeaderValue::from_str(cookie.as_str()).map_err(|_| ProtocolError::DataError)?;
 
     // Get owned passwords
     let res = client2
@@ -206,15 +205,14 @@ pub async fn get_all(
         .send()
         .await
         .map_err(|_| ProtocolError::DataError)?;
-    
-    let d = res.bytes()
-        .await
-        .map_err(|_| ProtocolError::DataError)?;
+
+    let d = res.bytes().await.map_err(|_| ProtocolError::DataError)?;
 
     let mut owned_passwords: Vec<(Password, Uuid)> = Vec::new();
     let da = bincode::serde::decode_from_slice::<Vec<(EP, Uuid)>>(&d, bincode::config::legacy())
-        .map_err(|_| ProtocolError::DataError)?.0;
-    
+        .map_err(|_| ProtocolError::DataError)?
+        .0;
+
     for g in da.iter() {
         let p = client.receive(g.0.clone())?;
         owned_passwords.push((p, g.1));
@@ -227,15 +225,17 @@ pub async fn get_all(
         .send()
         .await
         .map_err(|_| ProtocolError::DataError)?;
-    
-    let d = res.bytes()
-        .await
-        .map_err(|_| ProtocolError::DataError)?;
+
+    let d = res.bytes().await.map_err(|_| ProtocolError::DataError)?;
 
     let mut shared_passwords: Vec<(Password, Uuid, Uuid)> = Vec::new();
-    let shared_data = bincode::serde::decode_from_slice::<Vec<(SharedPass, Uuid, Uuid)>>(&d, bincode::config::legacy())
-        .map_err(|_| ProtocolError::DataError)?.0;
-    
+    let shared_data = bincode::serde::decode_from_slice::<Vec<(SharedPass, Uuid, Uuid)>>(
+        &d,
+        bincode::config::legacy(),
+    )
+    .map_err(|_| ProtocolError::DataError)?
+    .0;
+
     for (shared_pass, owner_id, pass_id) in shared_data {
         let password = client.decrypt_shared(shared_pass)?;
         shared_passwords.push((password, owner_id, pass_id));
@@ -248,18 +248,17 @@ pub async fn delete_pass(
     client2: &reqwest::Client,
     uuid: Uuid,
     uuid2: Uuid,
-    jar: std::sync::Arc<reqwest_cookie_store::CookieStoreRwLock>
+    jar: std::sync::Arc<reqwest_cookie_store::CookieStoreRwLock>,
 ) -> ResultP<()> {
-    let c = jar.read()
-        .map_err(|_| ProtocolError::DataError)?;
-    
+    let c = jar.read().map_err(|_| ProtocolError::DataError)?;
+
     let cookies = c.iter_any().collect::<Vec<_>>();
     if cookies.is_empty() {
         return Err(ProtocolError::AuthError);
     }
-    
+
     let cookie = format!("token={}", cookies[0].value().replace("\"", ""));
-    
+
     let res = client2
         .get(
             BASE_URL.to_string()
@@ -269,19 +268,20 @@ pub async fn delete_pass(
                 + uuid2.to_string().as_str()
                 + "/",
         )
-        .header(COOKIE, HeaderValue::from_str(cookie.as_str())
-            .map_err(|_| ProtocolError::DataError)?)
+        .header(
+            COOKIE,
+            HeaderValue::from_str(cookie.as_str()).map_err(|_| ProtocolError::DataError)?,
+        )
         .send()
         .await
         .map_err(|_| ProtocolError::DataError)?;
-    
-    let bytes = res.bytes()
-        .await
-        .map_err(|_| ProtocolError::DataError)?;
-    
+
+    let bytes = res.bytes().await.map_err(|_| ProtocolError::DataError)?;
+
     let response = bincode::serde::decode_from_slice::<String>(&bytes, bincode::config::legacy())
-        .map_err(|_| ProtocolError::DataError)?.0;
-    
+        .map_err(|_| ProtocolError::DataError)?
+        .0;
+
     match response.as_str() {
         "OK" => Ok(()),
         _ => Err(ProtocolError::DataError),
@@ -301,9 +301,12 @@ pub async fn share_pass(
     // Encrypt the password for sharing
     let shared_pass = client.share_encrypt(password, recipient_ky_p)?;
 
-    let c = jar.read().unwrap();
-    let cookie =
-        format!("token={}", c.iter_any().collect::<Vec<_>>()[0].value().replace("\"", ""));
+    let c = jar.read().map_err(|_| ProtocolError::DataError)?;
+    let cookies = c.iter_any().collect::<Vec<_>>();
+    if cookies.is_empty() {
+        return Err(ProtocolError::AuthError);
+    }
+    let cookie = format!("token={}", cookies[0].value().replace("\"", ""));
 
     let res = client2
         .post(
@@ -316,13 +319,24 @@ pub async fn share_pass(
                 + recipient_uuid.to_string().as_str()
                 + "/",
         )
-        .header(COOKIE, HeaderValue::from_str(cookie.as_str()).unwrap())
-        .body(bincode::serde::encode_to_vec(&shared_pass, bincode::config::legacy()).map_err(|_| ProtocolError::DataError)?)
+        .header(
+            COOKIE,
+            HeaderValue::from_str(cookie.as_str()).map_err(|_| ProtocolError::DataError)?,
+        )
+        .body(
+            bincode::serde::encode_to_vec(&shared_pass, bincode::config::legacy())
+                .map_err(|_| ProtocolError::DataError)?,
+        )
         .send()
         .await
         .map_err(|_| ProtocolError::DataError)?;
 
-    let response = bincode::serde::decode_from_slice::<String>(&res.bytes().await.map_err(|_| ProtocolError::DataError)?, bincode::config::legacy()).map_err(|_| ProtocolError::DataError)?.0;
+    let response = bincode::serde::decode_from_slice::<String>(
+        &res.bytes().await.map_err(|_| ProtocolError::DataError)?,
+        bincode::config::legacy(),
+    )
+    .map_err(|_| ProtocolError::DataError)?
+    .0;
     match response.as_str() {
         "Password shared successfully" => Ok(()),
         _ => Err(ProtocolError::DataError),
@@ -336,9 +350,12 @@ pub async fn unshare_pass(
     recipient_uuid: Uuid,
     jar: std::sync::Arc<reqwest_cookie_store::CookieStoreRwLock>,
 ) -> ResultP<()> {
-    let c = jar.read().unwrap();
-    let cookie =
-        format!("token={}", c.iter_any().collect::<Vec<_>>()[0].value().replace("\"", ""));
+    let c = jar.read().map_err(|_| ProtocolError::DataError)?;
+    let cookies = c.iter_any().collect::<Vec<_>>();
+    if cookies.is_empty() {
+        return Err(ProtocolError::AuthError);
+    }
+    let cookie = format!("token={}", cookies[0].value().replace("\"", ""));
 
     let res = client2
         .post(
@@ -351,12 +368,20 @@ pub async fn unshare_pass(
                 + recipient_uuid.to_string().as_str()
                 + "/",
         )
-        .header(COOKIE, HeaderValue::from_str(cookie.as_str()).unwrap())
+        .header(
+            COOKIE,
+            HeaderValue::from_str(cookie.as_str()).map_err(|_| ProtocolError::DataError)?,
+        )
         .send()
         .await
         .map_err(|_| ProtocolError::DataError)?;
 
-    let response = bincode::serde::decode_from_slice::<String>(&res.bytes().await.map_err(|_| ProtocolError::DataError)?, bincode::config::legacy()).map_err(|_| ProtocolError::DataError)?.0;
+    let response = bincode::serde::decode_from_slice::<String>(
+        &res.bytes().await.map_err(|_| ProtocolError::DataError)?,
+        bincode::config::legacy(),
+    )
+    .map_err(|_| ProtocolError::DataError)?
+    .0;
     match response.as_str() {
         "Password unshared successfully" => Ok(()),
         _ => Err(ProtocolError::DataError),
@@ -371,9 +396,12 @@ pub async fn get_shared_pass(
     client: &Client,
     jar: std::sync::Arc<reqwest_cookie_store::CookieStoreRwLock>,
 ) -> ResultP<Password> {
-    let c = jar.read().unwrap();
-    let cookie =
-        format!("token={}", c.iter_any().collect::<Vec<_>>()[0].value().replace("\"", ""));
+    let c = jar.read().map_err(|_| ProtocolError::DataError)?;
+    let cookies = c.iter_any().collect::<Vec<_>>();
+    if cookies.is_empty() {
+        return Err(ProtocolError::AuthError);
+    }
+    let cookie = format!("token={}", cookies[0].value().replace("\"", ""));
 
     let res = client2
         .get(
@@ -386,14 +414,20 @@ pub async fn get_shared_pass(
                 + pass_uuid.to_string().as_str()
                 + "/",
         )
-        .header(COOKIE, HeaderValue::from_str(cookie.as_str()).unwrap())
+        .header(
+            COOKIE,
+            HeaderValue::from_str(cookie.as_str()).map_err(|_| ProtocolError::DataError)?,
+        )
         .send()
         .await
         .map_err(|_| ProtocolError::DataError)?;
 
     let shared_pass = bincode::serde::decode_from_slice::<SharedPass>(
-        &res.bytes().await.map_err(|_| ProtocolError::DataError)?, bincode::config::legacy()
-    ).map_err(|_| ProtocolError::DataError)?.0;
+        &res.bytes().await.map_err(|_| ProtocolError::DataError)?,
+        bincode::config::legacy(),
+    )
+    .map_err(|_| ProtocolError::DataError)?
+    .0;
 
     // Decrypt the shared password
     client.decrypt_shared(shared_pass)

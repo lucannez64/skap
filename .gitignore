@@ -38,3 +38,5 @@ desktop.ini
 # Fichiers de test
 *.txt
 client
+
+/.trae

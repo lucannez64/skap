@@ -38,6 +38,18 @@ pub fn build(b: *std.Build) void {
     tui_cmd.setEnvironmentVariable("RUSTFLAGS", rust_flags);
     tui_step.dependOn(&tui_cmd.step);
 
+    // Cible pour la vérification
+    const check_server_step = b.step("check-server", "Check the server code");
+    const check_server_cmd = b.addSystemCommand(&[_][]const u8{ "cargo", "+nightly", "check", "--release", "-Zbuild-std", "--bin", "skap-server", "--features", "server" });
+    check_server_cmd.setEnvironmentVariable("RUSTFLAGS", rust_flags);
+    check_server_step.dependOn(&check_server_cmd.step);
+
+    // Cible pour la vérification
+    const check_client_step = b.step("check-client", "Check the client code");
+    const check_client_cmd = b.addSystemCommand(&[_][]const u8{ "cargo", "+nightly", "check", "--release", "-Zbuild-std", "--bin", "skap-client", "--features", "client" });
+    check_client_cmd.setEnvironmentVariable("RUSTFLAGS", rust_flags);
+    check_client_step.dependOn(&check_client_cmd.step);
+
     // Cible pour exécuter le serveur
     const run_server_step = b.step("run-server", "Build and run server");
     const run_server_cmd = b.addSystemCommand(&[_][]const u8{
