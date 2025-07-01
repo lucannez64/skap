@@ -71,9 +71,8 @@ EXPOSE 3030
 ENV DATABASE_URL="postgres://postgres:postgres@postgres:5432/skap"
 ENV REDIS_URL="redis://redis:6379"
 ENV CA_FILE="/app/certs/ca.pem"
-ENV BASE64_KEY="Cnq094AgzRxApmXC5vjCMzVncq42Ihm6fS7diRYhKqQ="
-
-# La clé BASE64_KEY doit être fournie lors de l'exécution
+# SECURITY: BASE64_KEY must be provided via environment variable at runtime
+# ENV BASE64_KEY should NOT be set in Dockerfile for security reasons
 
 # Passer à l'utilisateur non-root
 USER skap:skap

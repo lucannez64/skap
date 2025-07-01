@@ -584,7 +584,7 @@ impl Server<Secrets, PassesPostgres, Challenges, UsersPostgres, SharedPassesPost
 impl<T: SecretsT, U: PassesT, D: ChallengesT, E: UsersT, F: SharedPassesT> Server<T, U, D, E, F> {
     pub async fn add_user(&mut self, ck: &mut CK) -> ResultP<Uuid> {
         ck.set_id();
-        let id = ck.id.unwrap();
+        let id = ck.id.ok_or(ProtocolError::DataError)?;
         self.users.add_user(id, ck.clone()).await?;
         Ok(id)
     }
@@ -1002,34 +1002,25 @@ impl ClientEx {
         }
     }
 
-    pub fn to_string(&self) -> String {
+    pub fn to_string(&self) -> Result<String, ProtocolError> {
         let a = bincode::serde::encode_to_vec(&self, bincode::config::legacy())
-            .map_err(|_| ProtocolError::DataError)
-            .unwrap();
-        base64::engine::general_purpose::STANDARD_NO_PAD.encode(a)
+            .map_err(|_| ProtocolError::DataError)?;
+        Ok(base64::engine::general_purpose::STANDARD_NO_PAD.encode(a))
     }
 
     pub fn to_file(&self, file_name: String) -> ResultP<()> {
         let a = bincode::serde::encode_to_vec(&self, bincode::config::legacy())
-            .map_err(|_| ProtocolError::DataError)
-            .unwrap();
-        let mut file = std::fs::File::create(file_name)
-            .map_err(|_| ProtocolError::DataError)
-            .unwrap();
-        file.write_all(&a)
-            .map_err(|_| ProtocolError::DataError)
-            .unwrap();
+            .map_err(|_| ProtocolError::DataError)?;
+        let mut file = std::fs::File::create(file_name).map_err(|_| ProtocolError::DataError)?;
+        file.write_all(&a).map_err(|_| ProtocolError::DataError)?;
         Ok(())
     }
 
     pub fn from_file(file_name: String) -> ResultP<Self> {
-        let mut file = std::fs::File::open(file_name)
-            .map_err(|_| ProtocolError::DataError)
-            .unwrap();
+        let mut file = std::fs::File::open(file_name).map_err(|_| ProtocolError::DataError)?;
         let mut a = Vec::new();
         file.read_to_end(&mut a)
-            .map_err(|_| ProtocolError::DataError)
-            .unwrap();
+            .map_err(|_| ProtocolError::DataError)?;
         let c = bincode::serde::decode_from_slice(&a, bincode::config::legacy())
             .map_err(|_| ProtocolError::DataError)?
             .0;
@@ -1259,13 +1250,13 @@ mod tests {
     fn test_client_creation() {
         let client = Client::new();
         assert!(client.is_ok());
-        let client = client.unwrap();
+        let client = client.expect("Failed to create client in test");
         assert!(client.secret.is_none());
     }
 
     #[test]
     fn test_password_encryption() {
-        let client = Client::new().unwrap();
+        let client = Client::new().expect("Failed to create client in test");
         let pass = Password {
             username: "test".to_string(),
             password: "password123".to_string(),
@@ -1277,7 +1268,7 @@ mod tests {
 
         let encrypted = client.encrypt(pass.clone());
         assert!(encrypted.is_ok());
-        let ep = encrypted.unwrap();
+        let ep = encrypted.expect("Failed to encrypt password in test");
         assert!(!ep.ciphertext.is_empty());
         assert!(!ep.nonce.is_empty());
         assert!(ep.nonce2.is_none());
@@ -1286,16 +1277,18 @@ mod tests {
     #[test]
     fn test_shards() {
         let secret = b"test secret";
-        let shards = Shards::new(5, secret).unwrap();
-        let recovered = shards.recover().unwrap();
+        let shards = Shards::new(5, secret).expect("Failed to create shards in test");
+        let recovered = shards.recover().expect("Failed to recover secret in test");
         assert_eq!(recovered, secret);
     }
 
     #[test]
     fn test_client_signing() {
-        let client = Client::new().unwrap();
+        let client = Client::new().expect("Failed to create client in test");
         let challenge = b"test challenge";
-        let signature = client.sign(challenge);
+        let signature = client
+            .sign(challenge)
+            .expect("Failed to sign challenge in test");
         assert_eq!(signature.len(), ml_dsa_87::SIG_LEN);
     }
 }

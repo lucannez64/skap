@@ -46,6 +46,14 @@ impl RedisSecrets {
         let client = Client::open(url)?;
         // Vérifier la connexion au démarrage
         let mut con = client.get_connection()?;
+
+        // Authentification Redis si un mot de passe est configuré
+        if let Ok(redis_password) = std::env::var("REDIS_PASSWORD") {
+            if !redis_password.is_empty() {
+                let _: String = redis::cmd("AUTH").arg(&redis_password).query(&mut con)?;
+            }
+        }
+
         let _: String = redis::cmd("PING").query(&mut con)?;
 
         Ok(RedisSecrets { client })
@@ -67,6 +75,14 @@ impl RedisChallenges {
         let client = Client::open(url)?;
         // Vérifier la connexion au démarrage
         let mut con = client.get_connection()?;
+
+        // Authentification Redis si un mot de passe est configuré
+        if let Ok(redis_password) = std::env::var("REDIS_PASSWORD") {
+            if !redis_password.is_empty() {
+                let _: String = redis::cmd("AUTH").arg(&redis_password).query(&mut con)?;
+            }
+        }
+
         let _: String = redis::cmd("PING").query(&mut con)?;
 
         Ok(RedisChallenges { client })
@@ -170,26 +186,34 @@ mod tests {
 
     #[test]
     fn test_redis_secrets_storage() {
-        let mut secrets = RedisSecrets::new(TEST_REDIS_URL).unwrap();
+        let mut secrets =
+            RedisSecrets::new(TEST_REDIS_URL).expect("Failed to create RedisSecrets in test");
         let id = Uuid::new_v4();
         let secret = [42u8; 32];
+        let ciphertext = [45u8; KYBER_CIPHERTEXTBYTES];
 
-        secrets.add_secret(id, secret);
+        secrets.add_secret(id, secret, ciphertext);
         let retrieved = secrets.get_secret(id);
         assert!(retrieved.is_ok());
-        assert_eq!(retrieved.unwrap(), secret);
+        if let Some((retrieved_secret, _)) = retrieved.expect("Failed to get secret in test") {
+            assert_eq!(retrieved_secret, secret);
+        }
     }
 
     #[test]
     fn test_redis_challenges_storage() {
-        let mut challenges = RedisChallenges::new(TEST_REDIS_URL).unwrap();
+        let mut challenges =
+            RedisChallenges::new(TEST_REDIS_URL).expect("Failed to create RedisChallenges in test");
         let id = Uuid::new_v4();
         let challenge = [42u8; 32];
 
         challenges.add_challenge(id, challenge);
         let retrieved = challenges.get_challenge(id);
         assert!(retrieved.is_ok());
-        assert_eq!(retrieved.unwrap(), challenge);
+        assert_eq!(
+            retrieved.expect("Failed to get challenge in test"),
+            challenge
+        );
     }
 
     #[test]
@@ -198,7 +222,10 @@ mod tests {
         let vec = vec![1u8; 32];
         let result = vec_to_array(vec);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), [1u8; 32]);
+        assert_eq!(
+            result.expect("Failed to convert vec to array in test"),
+            [1u8; 32]
+        );
 
         // Test avec un vecteur trop petit
         let vec = vec![1u8; 16];

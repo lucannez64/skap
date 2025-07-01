@@ -659,16 +659,36 @@ async fn handle_edit_screen(
         KeyCode::Char(c) => match app.current_field {
             0 => app.edit_password.username.push(c),
             1 => app.edit_password.password.push(c),
-            2 => app.edit_password.url.as_mut().unwrap().push(c),
-            3 => app.edit_password.otp.as_mut().unwrap().push(c),
+            2 => {
+                if let Some(url) = app.edit_password.url.as_mut() {
+                    url.push(c);
+                }
+            }
+            3 => {
+                if let Some(otp) = app.edit_password.otp.as_mut() {
+                    otp.push(c);
+                }
+            }
             _ => {}
         },
         KeyCode::Backspace => {
             match app.current_field {
                 0 => app.edit_password.username.pop(),
                 1 => app.edit_password.password.pop(),
-                2 => app.edit_password.url.as_mut().unwrap().pop(),
-                3 => app.edit_password.otp.as_mut().unwrap().pop(),
+                2 => {
+                    if let Some(url) = app.edit_password.url.as_mut() {
+                        url.pop()
+                    } else {
+                        None
+                    }
+                }
+                3 => {
+                    if let Some(otp) = app.edit_password.otp.as_mut() {
+                        otp.pop()
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             };
         }
@@ -684,7 +704,14 @@ async fn handle_edit_screen(
                 if let Some(uuid) = app.editing_password_id {
                     if client::update_pass(
                         client2,
-                        client.1.id.unwrap(),
+                        client
+                            .1
+                            .id
+                            .ok_or("Missing client ID")
+                            .map_err(|e| {
+                                app.error_message = Some(e.to_string());
+                            })
+                            .unwrap_or_default(),
                         uuid,
                         &mut client.0,
                         app.edit_password.clone(),
@@ -816,8 +843,14 @@ fn render_add_screen(f: &mut Frame, app: &App, chunks: Vec<ratatui::layout::Rect
     let fields = vec![
         Line::from(format!("Username: {}", app.new_password.username)),
         Line::from(format!("Password: {}", app.new_password.password)),
-        Line::from(format!("URL: {}", app.new_password.url.as_ref().unwrap())),
-        Line::from(format!("OTP: {}", app.new_password.otp.as_ref().unwrap())),
+        Line::from(format!(
+            "URL: {}",
+            app.new_password.url.as_ref().unwrap_or(&String::new())
+        )),
+        Line::from(format!(
+            "OTP: {}",
+            app.new_password.otp.as_ref().unwrap_or(&String::new())
+        )),
     ];
 
     let form =
@@ -876,13 +909,18 @@ fn render_view_screen(f: &mut Frame, app: &mut App, chunks: Vec<ratatui::layout:
             ));
 
             if pass.otp.is_some() {
-                let totp = otp(pass.otp.as_ref().unwrap());
-                content = Line::from(format!(
-                    "{} @ {} - {}",
-                    pass.username,
-                    pass.url.as_ref().unwrap_or(&"Unknown".to_string()),
-                    totp.generate().to_string(),
-                ));
+                if let Some(otp_uri) = pass.otp.as_ref() {
+                    if let Ok(totp) = otp(otp_uri) {
+                        if let Ok(code) = totp.generate() {
+                            content = Line::from(format!(
+                                "{} @ {} - {}",
+                                pass.username,
+                                pass.url.as_ref().unwrap_or(&"Unknown".to_string()),
+                                code,
+                            ));
+                        }
+                    }
+                }
             }
 
             ListItem::new(content)
@@ -918,7 +956,10 @@ fn render_edit_screen(f: &mut Frame, app: &mut App, chunks: Vec<ratatui::layout:
     let fields = vec![
         Line::from(format!("Username: {}", app.edit_password.username)),
         Line::from(format!("Password: {}", app.edit_password.password)),
-        Line::from(format!("URL: {}", app.edit_password.url.as_ref().unwrap())),
+        Line::from(format!(
+            "URL: {}",
+            app.edit_password.url.as_ref().unwrap_or(&String::new())
+        )),
         Line::from(format!(
             "OTP: {}",
             app.edit_password
@@ -1095,7 +1136,7 @@ mod tests {
     #[test]
     fn test_totp_from_uri() {
         let uri = "otpauth://totp/Test:test@test.com?secret=JBSWY3DPEHPK3PXP&issuer=Test&algorithm=SHA1&digits=6&period=30";
-        let totp = TOTP::from_uri(uri).unwrap();
+        let totp = TOTP::from_uri(uri).expect("Failed to create TOTP from URI in test");
 
         assert_eq!(totp.secret, "JBSWY3DPEHPK3PXP");
         assert_eq!(totp.digits, 6);
@@ -1106,9 +1147,11 @@ mod tests {
     #[test]
     fn test_totp_generation() {
         let uri = "otpauth://totp/Test:test@test.com?secret=JBSWY3DPEHPK3PXP&issuer=Test&algorithm=SHA1&digits=6&period=30";
-        let totp = TOTP::from_uri(uri).unwrap();
+        let totp = TOTP::from_uri(uri).expect("Failed to create TOTP from URI in test");
 
-        let code = totp.generate().unwrap();
+        let code = totp
+            .generate()
+            .expect("Failed to generate TOTP code in test");
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|c| c.is_digit(10)));
     }
@@ -1124,12 +1167,12 @@ mod tests {
             }
         ]"#;
 
-        std::fs::write("test.json", json).unwrap();
+        std::fs::write("test.json", json).expect("Failed to write test file");
         let result = jsonfile_to_vec("test.json".to_string());
-        std::fs::remove_file("test.json").unwrap();
+        std::fs::remove_file("test.json").expect("Failed to remove test file");
 
         assert!(result.is_ok());
-        let passwords = result.unwrap();
+        let passwords = result.expect("Failed to parse JSON passwords in test");
         assert_eq!(passwords.len(), 1);
         assert_eq!(passwords[0].username, "test");
         assert_eq!(passwords[0].password, "password123");

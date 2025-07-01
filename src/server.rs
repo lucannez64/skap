@@ -1775,13 +1775,19 @@ async fn send_map(uui: String, uui2: String, server2: &ServerArc) -> Result<Resp
     if id.is_err() || id2.is_err() {
         return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).into());
     }
-    match server.send(id.unwrap(), id2.unwrap()).await {
-        Ok(r) => Ok(warp::reply::Response::new(
-            bincode::serde::encode_to_vec(&r, bincode::config::legacy())
-                .unwrap()
-                .into(),
-        )
-        .into_response()),
+    let id = match id {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid user UUID format".to_string()).into()),
+    };
+    let id2 = match id2 {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid pass UUID format".to_string()).into()),
+    };
+    match server.send(id, id2).await {
+        Ok(r) => match bincode::serde::encode_to_vec(&r, bincode::config::legacy()) {
+            Ok(encoded) => Ok(warp::reply::Response::new(encoded.into()).into_response()),
+            Err(_) => Ok(ApiError::InternalError("Failed to encode response".to_string()).into()),
+        },
         Err(ProtocolError::UserNotFound) => {
             return Ok(ApiError::BadRequest("User not found".to_string()).to_response(false))
         }
@@ -1843,13 +1849,21 @@ async fn create_pass_map(
     if id.is_err() || ep.is_err() {
         return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).into());
     }
-    match server.create_pass(id.unwrap(), ep.unwrap()).await {
-        Ok(id2) => Ok(warp::reply::Response::new(
-            bincode::serde::encode_to_vec(&id2, bincode::config::legacy())
-                .unwrap()
-                .into(),
-        )
-        .into_response()),
+    let id = match id {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).into()),
+    };
+    let ep = match ep {
+        Ok(encrypted_pass) => encrypted_pass,
+        Err(_) => {
+            return Ok(ApiError::BadRequest("Invalid encrypted pass format".to_string()).into())
+        }
+    };
+    match server.create_pass(id, ep).await {
+        Ok(id2) => match bincode::serde::encode_to_vec(&id2, bincode::config::legacy()) {
+            Ok(encoded) => Ok(warp::reply::Response::new(encoded.into()).into_response()),
+            Err(_) => Ok(ApiError::InternalError("Failed to encode response".to_string()).into()),
+        },
         Err(_) => Ok(ApiError::InternalError("Failed to create pass".to_string()).into()),
     }
 }
@@ -1882,12 +1896,20 @@ async fn sync_map(uui: String, server2: &ServerArc) -> Result<Response, Infallib
     if id.is_err() {
         return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).into());
     }
-    match server.sync(id.unwrap()).await {
-        Ok(ciphertextsync) => Ok(warp::reply::Response::new(
-            bincode::serde::encode_to_vec(&ciphertextsync.to_vec(), bincode::config::legacy())
-                .unwrap()
-                .into(),
-        )),
+    let id = match id {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).into()),
+    };
+    match server.sync(id).await {
+        Ok(ciphertextsync) => {
+            match bincode::serde::encode_to_vec(&ciphertextsync.to_vec(), bincode::config::legacy())
+            {
+                Ok(encoded) => Ok(warp::reply::Response::new(encoded.into())),
+                Err(_) => {
+                    Ok(ApiError::InternalError("Failed to encode sync data".to_string()).into())
+                }
+            }
+        }
         Err(_) => Ok(ApiError::InternalError("Failed to sync data".to_string()).into()),
     }
 }
@@ -1915,27 +1937,20 @@ async fn create_user_map(body: bytes::Bytes, server2: &ServerArc) -> Result<Resp
     );
     let ck = match bincode::serde::decode_from_slice::<CK, _>(&body, bincode::config::legacy()) {
         Ok((ck, _)) => {
-            log::debug!(
-                "Successfully deserialized user data with email: {}",
-                ck.email
-            );
+            log::debug!("Successfully deserialized user data");
             ck
         }
-        Err(e) => {
-            log::error!("Failed to deserialize user data: {:?}", e);
+        Err(_) => {
+            log::warn!("Failed to deserialize user data - invalid format");
             return Ok(ApiError::BadRequest("Invalid user data format".to_string()).into());
         }
     };
 
     let mut server = server2.write().await;
-    log::info!("Adding new user with email: {}", ck.email);
+    log::info!("Adding new user");
     match server.add_user(&mut ck.clone()).await {
         Ok(uuid) => {
-            log::info!(
-                "User created successfully with uuid {} and email {}",
-                uuid,
-                ck.email
-            );
+            log::info!("User created successfully");
             match bincode::serde::encode_to_vec(&ck, bincode::config::legacy()) {
                 Ok(serialized) => {
                     log::debug!(
@@ -1944,14 +1959,14 @@ async fn create_user_map(body: bytes::Bytes, server2: &ServerArc) -> Result<Resp
                     );
                     Ok(warp::reply::Response::new(serialized.into()))
                 }
-                Err(e) => {
-                    log::error!("Failed to serialize user data: {:?}", e);
+                Err(_) => {
+                    log::error!("Failed to serialize user data");
                     Ok(ApiError::InternalError("Failed to serialize user data".to_string()).into())
                 }
             }
         }
-        Err(e) => {
-            log::error!("Failed to create user: {:?}", e);
+        Err(_) => {
+            log::error!("Failed to create user");
             Ok(ApiError::InternalError("Failed to create user".to_string()).into())
         }
     }
@@ -1960,14 +1975,10 @@ async fn create_user_map(body: bytes::Bytes, server2: &ServerArc) -> Result<Resp
 async fn create_user_json_map(mut ck: CK, server2: &ServerArc) -> Result<Response, Infallible> {
     let mut server = server2.write().await;
 
-    log::info!("Adding new user with email: {}", ck.email);
+    log::info!("Adding new user");
     match server.add_user(&mut ck).await {
         Ok(uuid) => {
-            log::info!(
-                "User created successfully with uuid {} and email {}",
-                uuid,
-                ck.email
-            );
+            log::info!("User created successfully");
             ck.id = Some(uuid);
             Ok(warp::reply::json(&ck).into_response())
         }
@@ -1983,13 +1994,15 @@ async fn send_all_map(uui: String, server2: &ServerArc) -> Result<Response, Infa
         return Ok(ApiError::BadRequest("Invalid UUID format for pass ID".to_string()).into());
     }
     let server = server2.read().await;
-    match server.send_all(id.unwrap()).await {
-        Ok(r) => Ok(warp::reply::Response::new(
-            bincode::serde::encode_to_vec(&r, bincode::config::legacy())
-                .unwrap()
-                .into(),
-        )
-        .into_response()),
+    let id = match id {
+        Ok(uuid) => uuid,
+        Err(_) => return Ok(ApiError::BadRequest("Invalid UUID format".to_string()).into()),
+    };
+    match server.send_all(id).await {
+        Ok(r) => match bincode::serde::encode_to_vec(&r, bincode::config::legacy()) {
+            Ok(encoded) => Ok(warp::reply::Response::new(encoded.into()).into_response()),
+            Err(_) => Ok(ApiError::InternalError("Failed to encode response".to_string()).into()),
+        },
         Err(_) => Ok(ApiError::InternalError("Failed to send pass".to_string()).into()),
     }
 }
@@ -2002,10 +2015,11 @@ async fn send_all_json_map(uui: String, server2: &ServerArc) -> Result<Response,
         );
     }
     let server = server2.read().await;
-    match server.send_all(id.clone().unwrap()).await {
+    let user_id = id.unwrap();
+    match server.send_all(user_id).await {
         Ok(r) => {
             let passwords = r;
-            match server.get_all_shared_passes(id.unwrap()).await {
+            match server.get_all_shared_passes(user_id).await {
                 Ok(shared_passes) => {
                     let pp = shared_passes;
 
@@ -2067,14 +2081,13 @@ async fn share_pass_map(
         .store_shared_pass(owner_id, pass_uuid, recipient_id, shared_pass)
         .await
     {
-        Ok(()) => Ok(warp::reply::Response::new(
-            bincode::serde::encode_to_vec(
-                &"Password shared successfully",
-                bincode::config::legacy(),
-            )
-            .unwrap()
-            .into(),
-        )),
+        Ok(()) => match bincode::serde::encode_to_vec(
+            &"Password shared successfully",
+            bincode::config::legacy(),
+        ) {
+            Ok(encoded) => Ok(warp::reply::Response::new(encoded.into())),
+            Err(_) => Ok(ApiError::InternalError("Failed to encode response".to_string()).into()),
+        },
         Err(_) => Ok(ApiError::InternalError("Failed to share password".to_string()).into()),
     }
 }
@@ -2144,14 +2157,13 @@ async fn unshare_pass_map(
     };
 
     match server.unshare_pass(owner_id, pass_uuid, recipient_id).await {
-        Ok(()) => Ok(warp::reply::Response::new(
-            bincode::serde::encode_to_vec(
-                &"Password unshared successfully",
-                bincode::config::legacy(),
-            )
-            .unwrap()
-            .into(),
-        )),
+        Ok(()) => match bincode::serde::encode_to_vec(
+            &"Password unshared successfully",
+            bincode::config::legacy(),
+        ) {
+            Ok(encoded) => Ok(warp::reply::Response::new(encoded.into())),
+            Err(_) => Ok(ApiError::InternalError("Failed to encode response".to_string()).into()),
+        },
         Err(_) => Ok(ApiError::InternalError("Failed to unshare password".to_string()).into()),
     }
 }
@@ -2235,11 +2247,15 @@ async fn get_shared_pass_map(
         .get_shared_pass(recipient_id, owner_id, pass_uuid)
         .await
     {
-        Ok(shared_pass) => Ok(warp::reply::Response::new(
-            bincode::serde::encode_to_vec(&shared_pass, bincode::config::legacy())
-                .unwrap()
-                .into(),
-        )),
+        Ok(shared_pass) => {
+            match bincode::serde::encode_to_vec(&shared_pass, bincode::config::legacy()) {
+                Ok(encoded) => Ok(warp::reply::Response::new(encoded.into())),
+                Err(_) => Ok(ApiError::InternalError(
+                    "Failed to encode shared password".to_string(),
+                )
+                .into()),
+            }
+        }
         Err(_) => Ok(ApiError::InternalError("Failed to get shared password".to_string()).into()),
     }
 }
