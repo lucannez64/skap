@@ -1,8 +1,8 @@
 use crate::protocol::{ChallengesT, ProtocolError, ResultP, SecretsT, KYBER_CIPHERTEXTBYTES};
 use redis::{Client, Commands, RedisError};
+use std::env;
 use std::time::Duration;
 use uuid::Uuid;
-use std::env;
 
 // Constantes pour les préfixes de clés
 const SECRET_KEY_PREFIX: &str = "secret:";
@@ -57,12 +57,12 @@ impl RedisSecrets {
             } else {
                 url.to_string()
             };
-            
+
             Client::open(tls_url.as_str())?
         } else {
             Client::open(url)?
         };
-        
+
         // Vérifier la connexion au démarrage
         let mut con = client.get_connection()?;
 
@@ -117,12 +117,12 @@ impl RedisChallenges {
             } else {
                 url.to_string()
             };
-            
+
             Client::open(tls_url.as_str())?
         } else {
             Client::open(url)?
         };
-        
+
         // Vérifier la connexion au démarrage
         let mut con = client.get_connection()?;
 

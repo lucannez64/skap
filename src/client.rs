@@ -53,8 +53,9 @@ pub async fn auth(
 
     // Vérifier la signature
     let sign_result = sign?;
-    let serialized_sign = bincode::serde::encode_to_vec(sign_result.as_slice(), bincode::config::legacy())
-        .map_err(|_| ProtocolError::DataError)?;
+    let serialized_sign =
+        bincode::serde::encode_to_vec(sign_result.as_slice(), bincode::config::legacy())
+            .map_err(|_| ProtocolError::DataError)?;
 
     let res = client2
         .post(BASE_URL.to_string() + "verify/" + uuid.to_string().as_str() + "/")
@@ -280,9 +281,10 @@ pub async fn delete_pass(
 
     let bytes = res.bytes().await.map_err(|_| ProtocolError::DataError)?;
 
-    let response = bincode::serde::decode_from_slice::<String, _>(&bytes, bincode::config::legacy())
-        .map_err(|_| ProtocolError::DataError)?
-        .0;
+    let response =
+        bincode::serde::decode_from_slice::<String, _>(&bytes, bincode::config::legacy())
+            .map_err(|_| ProtocolError::DataError)?
+            .0;
 
     match response.as_str() {
         "OK" => Ok(()),

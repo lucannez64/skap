@@ -8,7 +8,7 @@ use crate::protocol::CK;
 use crate::protocol::EP;
 use crate::redis::RedisChallenges;
 use crate::redis::RedisSecrets;
-use crate::security::{SecurityManager, with_rate_limiting, with_login_rate_limiting};
+use crate::security::{with_login_rate_limiting, with_rate_limiting, SecurityManager};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use pasetors::claims::{Claims, ClaimsValidationRules};
 use pasetors::keys::SymmetricKey;
@@ -24,7 +24,8 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use uuid::Uuid;
-use warp::{reply::Response, Reply};
+use warp::http::{HeaderMap, HeaderName, HeaderValue};
+use warp::{reply::Response, Filter, Reply};
 
 // Constant-time string comparison to prevent timing attacks
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -456,14 +457,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let security_manager = Arc::new(SecurityManager::new());
     log::info!("SecurityManager initialized with rate limiting and session management");
 
+    // Start automatic session cleanup
+    SecurityManager::start_session_cleanup_task(security_manager.clone());
+    log::info!("Session cleanup task started");
+
     let mutexsk = Arc::new(RwLock::new(sk));
     let server_filter = warp::any().map(move || Arc::clone(&server2));
     let mutexsk_filter = warp::any().map(move || Arc::clone(&mutexsk));
-    
+
     // Create rate limiting filters before moving security_manager
     let rate_limit_filter = with_rate_limiting(security_manager.clone());
     let login_rate_limit_filter = with_login_rate_limiting(security_manager.clone());
-    
+
     let _security_filter = warp::any().map(move || Arc::clone(&security_manager));
     let cookies_filter = warp::filters::cookie::optional("token");
     let header_filter = warp::filters::header::optional("Authorization");
@@ -1337,7 +1342,34 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .or(reject_shared_pass)
         .or(reject_shared_pass_json)
         .or(get_shared_pass_status)
-        .or(get_shared_pass_status_json);
+        .or(get_shared_pass_status_json)
+        .map(|reply| {
+            warp::reply::with_header(
+                warp::reply::with_header(
+                    warp::reply::with_header(
+                        warp::reply::with_header(
+                            warp::reply::with_header(
+                                warp::reply::with_header(
+                                    reply,
+                                    "X-Content-Type-Options",
+                                    "nosniff",
+                                ),
+                                "X-Frame-Options",
+                                "DENY",
+                            ),
+                            "X-XSS-Protection",
+                            "1; mode=block",
+                        ),
+                        "Strict-Transport-Security",
+                        "max-age=31536000; includeSubDomains",
+                    ),
+                    "Content-Security-Policy",
+                    "default-src 'self'",
+                ),
+                "Referrer-Policy",
+                "strict-origin-when-cross-origin",
+            )
+        });
 
     // Ajout de logs pour les routes
 
@@ -1361,9 +1393,145 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ([0, 0, 0, 0], 3030).into()
     });
 
-    warp::serve(routes).run(socket_addr).await;
+    // Add token refresh endpoint
+    let refresh_token =
+        warp::post()
+            .and(warp::path("refresh_token"))
+            .and(mutexsk_filter.clone())
+            .and(cookies_filter.clone())
+            .and(header_filter.clone())
+            .and_then(
+                |sk: Arc<RwLock<SymmetricKey<V4>>>,
+                 token: Option<String>,
+                 header: Option<String>| async move {
+                    refresh_token_map(sk, token, header).await
+                },
+            );
+
+    let routes_with_refresh = routes.or(refresh_token);
+
+    warp::serve(routes_with_refresh).run(socket_addr).await;
     log::info!("Server shutdown");
     Ok(())
+}
+
+async fn refresh_token_map(
+    sk: Arc<RwLock<SymmetricKey<V4>>>,
+    token: Option<String>,
+    header: Option<String>,
+) -> Result<Response, Infallible> {
+    let token = token.or_else(|| {
+        header.and_then(|h| {
+            if h.starts_with("Bearer ") {
+                Some(h[7..].to_string())
+            } else {
+                None
+            }
+        })
+    });
+
+    let token = match token {
+        Some(t) => t,
+        None => {
+            return Ok(ApiError::Unauthorized("No token provided".to_string()).to_response(true))
+        }
+    };
+
+    // Check if token is blacklisted
+    let blacklist = get_token_blacklist();
+    if blacklist.read().await.contains(&token) {
+        return Ok(ApiError::Unauthorized("Token is blacklisted".to_string()).to_response(true));
+    }
+
+    // Validate current token
+    let sk_guard = sk.read().await;
+    let untrusted_token = match UntrustedToken::<Local, V4>::try_from(&token) {
+        Ok(token) => token,
+        Err(_) => {
+            return Ok(ApiError::Unauthorized("Invalid token format".to_string()).to_response(true))
+        }
+    };
+
+    let trusted_token = match local::decrypt(
+        &sk_guard,
+        &untrusted_token,
+        &ClaimsValidationRules::new(),
+        None,
+        None,
+    ) {
+        Ok(token) => token,
+        Err(_) => return Ok(ApiError::Unauthorized("Invalid token".to_string()).to_response(true)),
+    };
+
+    let claims = trusted_token.payload_claims().unwrap();
+    let user_id = match claims.get_claim("sub") {
+        Some(serde_json::Value::String(id)) => match Uuid::parse_str(id) {
+            Ok(uuid) => uuid,
+            Err(_) => {
+                return Ok(
+                    ApiError::Unauthorized("Invalid user ID in token".to_string())
+                        .to_response(true),
+                )
+            }
+        },
+        _ => {
+            return Ok(
+                ApiError::Unauthorized("Missing user ID in token".to_string()).to_response(true),
+            )
+        }
+    };
+
+    // Generate new token
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut new_claims = Claims::new().unwrap();
+    new_claims
+        .add_additional("sub", serde_json::Value::String(user_id.to_string()))
+        .unwrap();
+    new_claims
+        .add_additional(
+            "iat",
+            serde_json::Value::Number(serde_json::Number::from(now)),
+        )
+        .unwrap();
+    new_claims
+        .add_additional(
+            "exp",
+            serde_json::Value::Number(serde_json::Number::from(now + 3600)),
+        )
+        .unwrap(); // 1 hour
+
+    let new_token = match local::encrypt(&sk_guard, &new_claims, None, None) {
+        Ok(token) => token,
+        Err(_) => {
+            return Ok(
+                ApiError::InternalError("Failed to generate new token".to_string())
+                    .to_response(true),
+            )
+        }
+    };
+
+    // Add old token to blacklist
+    blacklist.write().await.insert(token);
+
+    // Return new token
+    let response = warp::reply::json(&serde_json::json!({
+        "token": new_token,
+        "expires_in": 3600
+    }));
+
+    Ok(warp::reply::with_header(
+        response,
+        "Set-Cookie",
+        format!(
+            "token={}; HttpOnly; Secure; SameSite=Strict; Max-Age=3600",
+            new_token
+        ),
+    )
+    .into_response())
 }
 
 async fn get_uuid_from_email_map(

@@ -2,9 +2,9 @@
 //! Implements rate limiting, session management, and audit logging
 
 use dashmap::DashMap;
-use governor::{Quota, RateLimiter};
 use governor::state::InMemoryState;
-use log::{info, warn, error};
+use governor::{Quota, RateLimiter};
+use log::{error, info, warn};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -30,13 +30,17 @@ pub struct UserSession {
 // Security manager
 pub struct SecurityManager {
     // Rate limiters
-    general_limiter: Arc<RateLimiter<IpAddr, dashmap::DashMap<IpAddr, InMemoryState>, governor::clock::DefaultClock>>,
-    login_limiter: Arc<RateLimiter<IpAddr, dashmap::DashMap<IpAddr, InMemoryState>, governor::clock::DefaultClock>>,
-    
+    general_limiter: Arc<
+        RateLimiter<IpAddr, dashmap::DashMap<IpAddr, InMemoryState>, governor::clock::DefaultClock>,
+    >,
+    login_limiter: Arc<
+        RateLimiter<IpAddr, dashmap::DashMap<IpAddr, InMemoryState>, governor::clock::DefaultClock>,
+    >,
+
     // Session management
     active_sessions: Arc<DashMap<String, UserSession>>, // token -> session
-    user_sessions: Arc<DashMap<Uuid, Vec<String>>>, // user_id -> tokens
-    
+    user_sessions: Arc<DashMap<Uuid, Vec<String>>>,     // user_id -> tokens
+
     // Audit logging
     audit_events: Arc<RwLock<Vec<AuditEvent>>>,
 }
@@ -66,12 +70,14 @@ pub enum AuditEventType {
 impl SecurityManager {
     pub fn new() -> Self {
         // Create rate limiters
-        let general_quota = Quota::per_minute(std::num::NonZeroU32::new(MAX_REQUESTS_PER_MINUTE).unwrap());
-        let login_quota = Quota::per_hour(std::num::NonZeroU32::new(MAX_LOGIN_ATTEMPTS_PER_HOUR).unwrap());
-        
+        let general_quota =
+            Quota::per_minute(std::num::NonZeroU32::new(MAX_REQUESTS_PER_MINUTE).unwrap());
+        let login_quota =
+            Quota::per_hour(std::num::NonZeroU32::new(MAX_LOGIN_ATTEMPTS_PER_HOUR).unwrap());
+
         let general_limiter = Arc::new(RateLimiter::dashmap(general_quota));
         let login_limiter = Arc::new(RateLimiter::dashmap(login_quota));
-        
+
         Self {
             general_limiter,
             login_limiter,
@@ -80,7 +86,7 @@ impl SecurityManager {
             audit_events: Arc::new(RwLock::new(Vec::new())),
         }
     }
-    
+
     // Rate limiting methods
     pub async fn check_general_rate_limit(&self, ip: IpAddr) -> Result<(), SecurityError> {
         match self.general_limiter.check_key(&ip) {
@@ -93,12 +99,13 @@ impl SecurityManager {
                     ip_address: Some(ip),
                     details: "General rate limit exceeded".to_string(),
                     success: false,
-                }).await;
+                })
+                .await;
                 Err(SecurityError::RateLimitExceeded)
             }
         }
     }
-    
+
     pub async fn check_login_rate_limit(&self, ip: IpAddr) -> Result<(), SecurityError> {
         match self.login_limiter.check_key(&ip) {
             Ok(_) => Ok(()),
@@ -110,20 +117,27 @@ impl SecurityManager {
                     ip_address: Some(ip),
                     details: "Login rate limit exceeded".to_string(),
                     success: false,
-                }).await;
+                })
+                .await;
                 Err(SecurityError::LoginRateLimitExceeded)
             }
         }
     }
-    
+
     // Session management methods
-    pub async fn create_session(&self, user_id: Uuid, token: String, ip: Option<IpAddr>) -> Result<(), SecurityError> {
+    pub async fn create_session(
+        &self,
+        user_id: Uuid,
+        token: String,
+        ip: Option<IpAddr>,
+    ) -> Result<(), SecurityError> {
         // Check concurrent session limit
-        let user_session_count = self.user_sessions
+        let user_session_count = self
+            .user_sessions
             .get(&user_id)
             .map(|sessions| sessions.len())
             .unwrap_or(0);
-            
+
         if user_session_count >= MAX_CONCURRENT_SESSIONS_PER_USER {
             self.log_audit_event(AuditEvent {
                 timestamp: SystemTime::now(),
@@ -132,10 +146,11 @@ impl SecurityManager {
                 ip_address: ip,
                 details: format!("Concurrent session limit exceeded: {}", user_session_count),
                 success: false,
-            }).await;
+            })
+            .await;
             return Err(SecurityError::SessionLimitExceeded);
         }
-        
+
         let session = UserSession {
             user_id,
             token: token.clone(),
@@ -143,16 +158,16 @@ impl SecurityManager {
             last_activity: SystemTime::now(),
             ip_address: ip,
         };
-        
+
         // Add session
         self.active_sessions.insert(token.clone(), session);
-        
+
         // Update user sessions
         self.user_sessions
             .entry(user_id)
             .or_insert_with(Vec::new)
             .push(token.clone());
-            
+
         self.log_audit_event(AuditEvent {
             timestamp: SystemTime::now(),
             event_type: AuditEventType::Login,
@@ -160,11 +175,12 @@ impl SecurityManager {
             ip_address: ip,
             details: "Session created successfully".to_string(),
             success: true,
-        }).await;
-        
+        })
+        .await;
+
         Ok(())
     }
-    
+
     pub async fn remove_session(&self, token: &str) -> Result<(), SecurityError> {
         if let Some((_, session)) = self.active_sessions.remove(token) {
             // Remove from user sessions
@@ -175,7 +191,7 @@ impl SecurityManager {
                     self.user_sessions.remove(&session.user_id);
                 }
             }
-            
+
             self.log_audit_event(AuditEvent {
                 timestamp: SystemTime::now(),
                 event_type: AuditEventType::Logout,
@@ -183,14 +199,15 @@ impl SecurityManager {
                 ip_address: session.ip_address,
                 details: "Session removed successfully".to_string(),
                 success: true,
-            }).await;
-            
+            })
+            .await;
+
             Ok(())
         } else {
             Err(SecurityError::SessionNotFound)
         }
     }
-    
+
     pub fn update_session_activity(&self, token: &str) -> Result<(), SecurityError> {
         if let Some(mut session) = self.active_sessions.get_mut(token) {
             session.last_activity = SystemTime::now();
@@ -199,17 +216,17 @@ impl SecurityManager {
             Err(SecurityError::SessionNotFound)
         }
     }
-    
+
     pub fn get_session(&self, token: &str) -> Option<UserSession> {
         self.active_sessions.get(token).map(|s| s.clone())
     }
-    
+
     pub async fn cleanup_expired_sessions(&self) {
         let now = SystemTime::now();
         let session_timeout = Duration::from_secs(3600); // 1 hour
-        
+
         let mut expired_tokens = Vec::new();
-        
+
         for entry in self.active_sessions.iter() {
             let (token, session) = entry.pair();
             if let Ok(duration) = now.duration_since(session.last_activity) {
@@ -218,13 +235,29 @@ impl SecurityManager {
                 }
             }
         }
-        
+
         for token in expired_tokens {
             let _ = self.remove_session(&token).await;
         }
     }
-    
-    pub async fn update_user_session(&self, _user_id: Uuid, token: String) -> Result<(), SecurityError> {
+
+    // Start automatic session cleanup task
+    pub fn start_session_cleanup_task(security_manager: Arc<SecurityManager>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
+            loop {
+                interval.tick().await;
+                security_manager.cleanup_expired_sessions().await;
+                log::debug!("Session cleanup completed");
+            }
+        });
+    }
+
+    pub async fn update_user_session(
+        &self,
+        _user_id: Uuid,
+        token: String,
+    ) -> Result<(), SecurityError> {
         if let Some(mut session) = self.active_sessions.get_mut(&token) {
             session.last_activity = SystemTime::now();
             Ok(())
@@ -232,47 +265,57 @@ impl SecurityManager {
             Err(SecurityError::SessionNotFound)
         }
     }
-    
+
     // Audit logging methods
     pub async fn log_audit_event(&self, event: AuditEvent) {
         let mut events = self.audit_events.write().await;
-        
+
         // Log to application logger
         match event.event_type {
             AuditEventType::Login => {
                 if event.success {
-                    info!("[AUDIT] Login successful - User: {:?}, IP: {:?}", event.user_id, event.ip_address);
+                    info!(
+                        "[AUDIT] Login successful - User: {:?}, IP: {:?}",
+                        event.user_id, event.ip_address
+                    );
                 } else {
-                    warn!("[AUDIT] Login failed - User: {:?}, IP: {:?}, Details: {}", event.user_id, event.ip_address, event.details);
+                    warn!(
+                        "[AUDIT] Login failed - User: {:?}, IP: {:?}, Details: {}",
+                        event.user_id, event.ip_address, event.details
+                    );
                 }
-            },
-            AuditEventType::RateLimitExceeded | AuditEventType::SessionLimitExceeded | AuditEventType::SecurityViolation => {
-                warn!("[AUDIT] Security event - Type: {:?}, IP: {:?}, Details: {}", event.event_type, event.ip_address, event.details);
-            },
+            }
+            AuditEventType::RateLimitExceeded
+            | AuditEventType::SessionLimitExceeded
+            | AuditEventType::SecurityViolation => {
+                warn!(
+                    "[AUDIT] Security event - Type: {:?}, IP: {:?}, Details: {}",
+                    event.event_type, event.ip_address, event.details
+                );
+            }
             _ => {
-                info!("[AUDIT] Event - Type: {:?}, User: {:?}, Success: {}, Details: {}", event.event_type, event.user_id, event.success, event.details);
+                info!(
+                    "[AUDIT] Event - Type: {:?}, User: {:?}, Success: {}, Details: {}",
+                    event.event_type, event.user_id, event.success, event.details
+                );
             }
         }
-        
+
         events.push(event);
-        
+
         // Keep only last 10000 events to prevent memory issues
         if events.len() > 10000 {
             events.drain(0..1000);
         }
     }
-    
+
     pub async fn get_audit_events(&self, limit: Option<usize>) -> Vec<AuditEvent> {
         let events = self.audit_events.read().await;
         let limit = limit.unwrap_or(100);
-        
-        events.iter()
-            .rev()
-            .take(limit)
-            .cloned()
-            .collect()
+
+        events.iter().rev().take(limit).cloned().collect()
     }
-    
+
     // Security metrics
     pub fn get_security_metrics(&self) -> SecurityMetrics {
         SecurityMetrics {

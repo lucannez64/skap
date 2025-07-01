@@ -1255,7 +1255,10 @@ mod tests {
     fn test_password_encryption() {
         let client = Client::new().expect("Failed to create client in test");
         // Generate secure test password dynamically
-        let test_password = format!("test_pass_{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
+        let test_password = format!(
+            "test_pass_{}",
+            uuid::Uuid::new_v4().to_string()[..8].to_string()
+        );
         let pass = Password {
             username: "test".to_string(),
             password: test_password,
