@@ -15,10 +15,14 @@ use pasetors::claims::{Claims, ClaimsValidationRules};
 use pasetors::keys::{Generate, SymmetricKey};
 use pasetors::token::UntrustedToken;
 use pasetors::{local, version4::V4, Local};
+use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 use warp::{reject, reply::Response, Filter, Rejection, Reply};
@@ -34,6 +38,61 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         result |= byte_a ^ byte_b;
     }
     result == 0
+}
+
+// Input validation functions
+static EMAIL_REGEX: OnceLock<Regex> = OnceLock::new();
+
+fn validate_uuid(uuid_str: &str) -> Result<Uuid, ApiError> {
+    // Sanitize input - remove quotes and whitespace
+    let cleaned = uuid_str.trim().trim_matches('"');
+
+    // Validate length
+    if cleaned.len() > 36 {
+        return Err(ApiError::BadRequest("UUID too long".to_string()));
+    }
+
+    Uuid::parse_str(cleaned).map_err(|_| ApiError::BadRequest("Invalid UUID format".to_string()))
+}
+
+fn validate_email(email: &str) -> Result<String, ApiError> {
+    // Sanitize input
+    let cleaned = email.trim();
+
+    // Basic length validation
+    if cleaned.len() > 254 {
+        return Err(ApiError::BadRequest("Email too long".to_string()));
+    }
+
+    if cleaned.len() < 3 {
+        return Err(ApiError::BadRequest("Email too short".to_string()));
+    }
+
+    // Initialize regex once
+    let email_regex = EMAIL_REGEX.get_or_init(|| {
+        Regex::new(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+            .expect("Invalid email regex")
+    });
+
+    if email_regex.is_match(cleaned) {
+        Ok(cleaned.to_string())
+    } else {
+        Err(ApiError::BadRequest("Invalid email format".to_string()))
+    }
+}
+
+fn validate_input_length(
+    input: &[u8],
+    max_length: usize,
+    field_name: &str,
+) -> Result<(), ApiError> {
+    if input.len() > max_length {
+        return Err(ApiError::BadRequest(format!(
+            "{} exceeds maximum length",
+            field_name
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -60,17 +119,26 @@ impl warp::reject::Reject for ApiError {}
 
 impl ApiError {
     fn to_response(&self, is_json: bool) -> Response {
-        let (code, message) = match self {
-            ApiError::BadRequest(msg) => (400, msg),
-            ApiError::Unauthorized(msg) => (401, msg),
-            ApiError::InternalError(msg) => (500, msg),
-            ApiError::AuthenticationFailed(msg) => (401, msg),
+        // Log detailed error server-side
+        match self {
+            ApiError::BadRequest(msg) => log::warn!("Bad request: {}", msg),
+            ApiError::Unauthorized(msg) => log::warn!("Unauthorized access: {}", msg),
+            ApiError::InternalError(msg) => log::error!("Internal error: {}", msg),
+            ApiError::AuthenticationFailed(msg) => log::warn!("Authentication failed: {}", msg),
+        }
+
+        // Return generic error messages to client
+        let (code, generic_message) = match self {
+            ApiError::BadRequest(_) => (400, "Bad Request"),
+            ApiError::Unauthorized(_) => (401, "Unauthorized"),
+            ApiError::InternalError(_) => (500, "Internal Server Error"),
+            ApiError::AuthenticationFailed(_) => (401, "Authentication Failed"),
         };
 
         if is_json {
-            self.create_json_response(code, message)
+            self.create_json_response(code, generic_message)
         } else {
-            self.create_binary_response(code, message)
+            self.create_binary_response(code, generic_message)
         }
     }
 
@@ -127,6 +195,97 @@ pub type ServerArc = Arc<
     >,
 >;
 
+// Token blacklist for logout functionality
+static TOKEN_BLACKLIST: OnceLock<Arc<RwLock<HashSet<String>>>> = OnceLock::new();
+
+fn get_token_blacklist() -> &'static Arc<RwLock<HashSet<String>>> {
+    TOKEN_BLACKLIST.get_or_init(|| Arc::new(RwLock::new(HashSet::new())))
+}
+
+async fn is_token_blacklisted(token: &str) -> bool {
+    let blacklist = get_token_blacklist().read().await;
+    blacklist.contains(token)
+}
+
+async fn blacklist_token(token: String) {
+    let mut blacklist = get_token_blacklist().write().await;
+    blacklist.insert(token);
+}
+
+// Session management functions
+async fn logout_user(token: String) -> Result<Response, Infallible> {
+    blacklist_token(token).await;
+
+    let response = warp::reply::with_status(
+        warp::reply::json(&serde_json::json!({"message": "Logged out successfully"})),
+        warp::http::StatusCode::OK,
+    );
+
+    // Clear the cookie
+    let response = warp::reply::with_header(
+        response,
+        "Set-Cookie",
+        "token=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+    );
+
+    Ok(response.into_response())
+}
+
+async fn refresh_token(
+    sk: Arc<RwLock<SymmetricKey<V4>>>,
+    old_token: String,
+    uuid: &str,
+) -> Result<Response, Infallible> {
+    // Validate the old token first
+    if is_token_blacklisted(&old_token).await {
+        return Ok(ApiError::Unauthorized("Token has been revoked".to_string()).to_response(true));
+    }
+
+    // Blacklist the old token
+    blacklist_token(old_token).await;
+
+    // Generate new token
+    match generate_new_token(sk, uuid).await {
+        Ok(new_token) => {
+            let response = warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"token": new_token})),
+                warp::http::StatusCode::OK,
+            );
+
+            let cookie_value = format!(
+                "token={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600",
+                new_token
+            );
+
+            let response = warp::reply::with_header(response, "Set-Cookie", cookie_value);
+            Ok(response.into_response())
+        }
+        Err(e) => Ok(e),
+    }
+}
+
+async fn generate_new_token(
+    sk: Arc<RwLock<SymmetricKey<V4>>>,
+    uuid: &str,
+) -> Result<String, Response> {
+    let sk = sk.read().await;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ApiError::InternalError("Time error".to_string()).to_response(true))?
+        .as_secs();
+
+    let exp = now + 3600; // 1 hour expiration
+
+    let mut claims = pasetors::claims::Claims::new().unwrap();
+    claims.subject(uuid).unwrap();
+    claims.expiration(&exp.to_string()).unwrap();
+    claims.issued_at(&now.to_string()).unwrap();
+
+    local::encrypt(&sk, &claims, None, Some(b"skap")).map_err(|_| {
+        ApiError::InternalError("Token generation failed".to_string()).to_response(true)
+    })
+}
+
 async fn auth_validation(
     sk: Arc<RwLock<SymmetricKey<V4>>>,
     uuid: &str,
@@ -134,6 +293,13 @@ async fn auth_validation(
     is_json: bool,
 ) -> Result<(), Response> {
     if let Some(token) = token {
+        // Check if token is blacklisted
+        if is_token_blacklisted(&token).await {
+            return Err(
+                ApiError::Unauthorized("Token has been revoked".to_string()).to_response(is_json)
+            );
+        }
+
         let sk = sk.read().await;
         let validation = ClaimsValidationRules::new();
         let untrusted_token = UntrustedToken::<Local, V4>::try_from(&token).map_err(|_| {
@@ -233,46 +399,59 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     ));
 
-    let mut sk: SymmetricKey<V4>;
-    if std::env::var("BASE64_KEY").is_err() {
-        log::warn!("BASE64_KEY not set, generating new key");
-        sk = match SymmetricKey::<V4>::generate() {
-            Ok(key) => key,
-            Err(e) => {
-                log::error!("Failed to generate symmetric key: {:?}", e);
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Key generation error: {:?}", e),
-                )));
-            }
-        };
-        log::info!("Generated new BASE64_KEY");
-    } else {
-        let base64k = std::env::var("BASE64_KEY")
-            .map_err(|_| "BASE64_KEY environment variable must be set")?;
-        log::info!("Using provided BASE64_KEY");
-        let skbytes = match STANDARD.decode(&base64k) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                log::error!("Failed to decode BASE64_KEY: {:?}", e);
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Key decoding error: {:?}", e),
-                )));
-            }
-        };
-        sk = match SymmetricKey::<V4>::from(&skbytes) {
-            Ok(key) => key,
-            Err(e) => {
-                log::error!("Failed to create symmetric key from bytes: {:?}", e);
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Key creation error: {:?}", e),
-                )));
-            }
-        };
-        log::info!("Successfully loaded symmetric key from BASE64_KEY");
+    // BASE64_KEY est OBLIGATOIRE - pas de génération automatique en production
+    let base64k = std::env::var("BASE64_KEY")
+        .map_err(|_| "BASE64_KEY environment variable must be set for security")?;
+
+    if base64k.is_empty() {
+        log::error!("BASE64_KEY cannot be empty");
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "BASE64_KEY cannot be empty for security reasons",
+        )));
     }
+
+    // Validation de la longueur minimale de la clé (32 bytes en base64 = ~44 caractères)
+    if base64k.len() < 44 {
+        log::error!("BASE64_KEY is too short, minimum 44 characters required");
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "BASE64_KEY is too short for security",
+        )));
+    }
+
+    log::info!("Using provided BASE64_KEY");
+    let skbytes = match STANDARD.decode(&base64k) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::error!("Failed to decode BASE64_KEY: {:?}", e);
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Invalid BASE64_KEY format",
+            )));
+        }
+    };
+
+    // Validation de la longueur des bytes décodés
+    if skbytes.len() < 32 {
+        log::error!("Decoded BASE64_KEY is too short, minimum 32 bytes required");
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "BASE64_KEY decoded length is insufficient for security",
+        )));
+    }
+
+    let sk = match SymmetricKey::<V4>::from(&skbytes) {
+        Ok(key) => key,
+        Err(e) => {
+            log::error!("Failed to create symmetric key from bytes: {:?}", e);
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Invalid BASE64_KEY format for symmetric key",
+            )));
+        }
+    };
+    log::info!("Successfully loaded and validated symmetric key from BASE64_KEY");
 
     let mutexsk = Arc::new(RwLock::new(sk));
     let server_filter = warp::any().map(move || Arc::clone(&server2));

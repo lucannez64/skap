@@ -3273,6 +3273,7 @@ dependencies = [
  "rand 0.9.1",
  "ratatui",
  "redis",
+ "regex",
  "reqwest",
  "reqwest_cookie_store",
  "ring",

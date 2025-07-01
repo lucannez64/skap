@@ -25,7 +25,7 @@ services:
       - "5432:5432"
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}  # SECURITY: Change default password
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set for security}  # SECURITY: Password is mandatory
       - POSTGRES_DB=${POSTGRES_DB:-skap}
     volumes:
       - postgres-data:/var/lib/postgresql/data
@@ -48,14 +48,14 @@ services:
     ports:
       - "6379:6379"
     environment:
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-}  # SECURITY: Set Redis password
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD must be set for security}  # SECURITY: Redis password is mandatory
     command: >
       sh -c '
-        if [ -n "$REDIS_PASSWORD" ]; then
-          redis-server --requirepass "$REDIS_PASSWORD"
-        else
-          redis-server
+        if [ -z "$REDIS_PASSWORD" ]; then
+          echo "ERROR: REDIS_PASSWORD must be set for security" >&2
+          exit 1
         fi
+        redis-server --requirepass "$REDIS_PASSWORD" --protected-mode yes --bind 0.0.0.0
       '
     volumes:
       - redis-data:/data
@@ -65,15 +65,15 @@ services:
     healthcheck:
       test: >
         sh -c '
-          if [ -n "$REDIS_PASSWORD" ]; then
-            redis-cli -a "$REDIS_PASSWORD" ping
-          else
-            redis-cli ping
+          if [ -z "$REDIS_PASSWORD" ]; then
+            echo "ERROR: REDIS_PASSWORD not set" >&2
+            exit 1
           fi
+          redis-cli -a "$REDIS_PASSWORD" ping
         '
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: 30s
+      timeout: 10s
+      retries: 3
       
   # Service Skap Server
   skap-server:
@@ -81,10 +81,10 @@ services:
     ports:
       - "3030:3030"
     environment:
-      - DATABASE_URL=postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-skap}
+      - DATABASE_URL=postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-skap}
       - REDIS_URL=redis://redis:6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-}  # SECURITY: Redis authentication
-      - BASE64_KEY=${BASE64_KEY:-}  # SECURITY: Must be provided via environment variable
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD must be set for security}  # SECURITY: Redis authentication mandatory
+      - BASE64_KEY=${BASE64_KEY:?BASE64_KEY must be provided for security}  # SECURITY: Must be provided via environment variable
     volumes:
       - ca-cert:/app/certs:ro
     depends_on:

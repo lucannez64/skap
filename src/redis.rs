@@ -47,13 +47,22 @@ impl RedisSecrets {
         // Vérifier la connexion au démarrage
         let mut con = client.get_connection()?;
 
-        // Authentification Redis si un mot de passe est configuré
-        if let Ok(redis_password) = std::env::var("REDIS_PASSWORD") {
-            if !redis_password.is_empty() {
-                let _: String = redis::cmd("AUTH").arg(&redis_password).query(&mut con)?;
-            }
+        // Authentification Redis OBLIGATOIRE en production
+        let redis_password = std::env::var("REDIS_PASSWORD").map_err(|_| {
+            RedisError::from((
+                redis::ErrorKind::AuthenticationFailed,
+                "REDIS_PASSWORD environment variable must be set",
+            ))
+        })?;
+
+        if redis_password.is_empty() {
+            return Err(RedisError::from((
+                redis::ErrorKind::AuthenticationFailed,
+                "REDIS_PASSWORD cannot be empty",
+            )));
         }
 
+        let _: String = redis::cmd("AUTH").arg(&redis_password).query(&mut con)?;
         let _: String = redis::cmd("PING").query(&mut con)?;
 
         Ok(RedisSecrets { client })
@@ -76,13 +85,22 @@ impl RedisChallenges {
         // Vérifier la connexion au démarrage
         let mut con = client.get_connection()?;
 
-        // Authentification Redis si un mot de passe est configuré
-        if let Ok(redis_password) = std::env::var("REDIS_PASSWORD") {
-            if !redis_password.is_empty() {
-                let _: String = redis::cmd("AUTH").arg(&redis_password).query(&mut con)?;
-            }
+        // Authentification Redis OBLIGATOIRE en production
+        let redis_password = std::env::var("REDIS_PASSWORD").map_err(|_| {
+            RedisError::from((
+                redis::ErrorKind::AuthenticationFailed,
+                "REDIS_PASSWORD environment variable must be set",
+            ))
+        })?;
+
+        if redis_password.is_empty() {
+            return Err(RedisError::from((
+                redis::ErrorKind::AuthenticationFailed,
+                "REDIS_PASSWORD cannot be empty",
+            )));
         }
 
+        let _: String = redis::cmd("AUTH").arg(&redis_password).query(&mut con)?;
         let _: String = redis::cmd("PING").query(&mut con)?;
 
         Ok(RedisChallenges { client })
